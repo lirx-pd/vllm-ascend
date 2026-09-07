@@ -106,6 +106,25 @@
 #       handles a pre-sharded visible-devices env var, or vLLM-Ascend stops
 #       relying on application-level device slicing for DP.
 #
+# ** 4a. File: platform/patch_encoder_cache_manager.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.encoder_cache_manager.EncoderCacheManager.free_encoder_input`
+#   2. `vllm.v1.core.encoder_cache_manager.EncoderCacheManager.get_freed_mm_hashes`
+#    Why:
+#       The pinned vLLM revision predates two encoder-cache lifetime fixes used
+#       by ECMooncakeConnector: repeated multimodal hashes must retain their
+#       request reference until their final occurrence is released, and an item
+#       freed then reallocated in one schedule must not be reported as freed.
+#    How:
+#       Backport the narrow upstream fixes without changing the fixed vLLM
+#       checkout. The scheduler continues to own the normal EncoderCache
+#       lifecycle and only receives correct freed-hash notifications.
+#    Related PR (if no, explain why):
+#       https://github.com/vllm-project/vllm/pull/41567
+#    Future Plan:
+#       Remove this patch when the supported vLLM revision includes these
+#       encoder-cache lifetime fixes.
+#
 # ** 5. File: platform/patch_dyntra_lb_core.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.engine.core.EngineCoreProc.run_engine_core`

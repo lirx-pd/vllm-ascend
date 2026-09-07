@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -2036,6 +2037,129 @@ class TestNPUModelRunnerDebugger(unittest.TestCase):
 
         runner._sync_device.assert_not_called()
         self.assertFalse(hasattr(runner, "_execution_start_time"))
+
+    @patch("vllm_ascend.worker.model_runner_v1.has_kv_transfer_group", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=True)
+    @patch("vllm_ascend.worker.model_runner_v1.get_ec_transfer")
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    @patch("vllm_ascend.worker.model_runner_v1.record_function_or_nullcontext")
+    @patch("vllm_ascend.worker.model_runner_v1.vllm_version_is", return_value=False)
+    def test_encoder_producer_returns_ec_completion_without_fake_token(
+        self,
+        _mock_version,
+        mock_record_function,
+        mock_get_pp_group,
+        mock_get_ec_transfer,
+        _mock_has_ec_transfer,
+        _mock_has_kv_transfer_group,
+    ):
+        from contextlib import nullcontext
+
+        mock_record_function.return_value = nullcontext()
+        mock_get_pp_group.return_value = SimpleNamespace(world_size=1)
+        worker_meta = object()
+        connector = MagicMock()
+        connector.is_producer = True
+        connector.is_consumer = False
+        connector.get_finished.return_value = ({"sent"}, {"received"})
+        connector.build_connector_worker_meta.return_value = worker_meta
+        mock_get_ec_transfer.return_value = connector
+
+        runner = self._build_runner()
+        runner.vllm_config = MagicMock()
+        runner.ascend_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(enabled=False, need_timing=False))
+        )
+        runner.execute_model_state = None
+        runner.speculative_config = None
+        runner.use_async_scheduling = False
+        runner.synchronize_input_prep = nullcontext
+        runner._update_states = MagicMock(return_value=None)
+        runner.encoder_cache = {}
+        runner._execute_mm_encoder = MagicMock()
+        runner.parallel_config = SimpleNamespace(distributed_executor_backend=None, data_parallel_size=1)
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=2,
+            num_scheduled_tokens={"req0": 2},
+            ec_connector_metadata=object(),
+            finished_req_ids={"req0"},
+        )
+
+        output = runner.execute_model(scheduler_output)
+
+        self.assertEqual(output.sampled_token_ids, [[]])
+        self.assertIs(output.ec_connector_output.ec_connector_worker_meta, worker_meta)
+        connector.start_save_caches.assert_called_once_with(encoder_cache=runner.encoder_cache)
+        runner._execute_mm_encoder.assert_called_once_with(scheduler_output)
+
+    @patch("vllm_ascend.worker.model_runner_v1.has_kv_transfer_group", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=True)
+    @patch("vllm_ascend.worker.model_runner_v1.get_ec_transfer")
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    @patch("vllm_ascend.worker.model_runner_v1.record_function_or_nullcontext")
+    @patch("vllm_ascend.worker.model_runner_v1.vllm_version_is", return_value=False)
+    def test_zero_token_consumer_reports_ec_completion(
+        self,
+        _mock_version,
+        mock_record_function,
+        mock_get_pp_group,
+        mock_get_ec_transfer,
+        _mock_has_ec_transfer,
+        _mock_has_kv_transfer_group,
+    ):
+        from contextlib import nullcontext
+
+        mock_record_function.return_value = nullcontext()
+        mock_get_pp_group.return_value = SimpleNamespace(world_size=1)
+        worker_meta = object()
+        connector = MagicMock()
+        connector.is_producer = False
+        connector.is_consumer = True
+        connector.get_finished.return_value = (set(), {"received"})
+        connector.build_connector_worker_meta.return_value = worker_meta
+        mock_get_ec_transfer.return_value = connector
+
+        runner = self._build_runner()
+        runner.vllm_config = MagicMock()
+        runner.ascend_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(enabled=False, need_timing=False))
+        )
+        runner.execute_model_state = None
+        runner.speculative_config = None
+        runner.use_async_scheduling = False
+        runner.synchronize_input_prep = nullcontext
+        runner._update_states = MagicMock(return_value=None)
+        runner.encoder_cache = {}
+        runner.parallel_config = SimpleNamespace(distributed_executor_backend=None, data_parallel_size=1)
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=0,
+            num_scheduled_tokens={},
+            ec_connector_metadata=object(),
+            finished_req_ids=set(),
+        )
+
+        output = runner.execute_model(scheduler_output)
+
+        self.assertIs(output.ec_connector_output.ec_connector_worker_meta, worker_meta)
+        connector.start_load_caches.assert_called_once_with(runner.encoder_cache)
+
+    @patch("vllm_ascend.worker.model_runner_v1.has_kv_transfer_group", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.get_ec_transfer")
+    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=True)
+    def test_no_forward_without_ec_metadata_skips_connector(
+        self,
+        _mock_has_ec_transfer,
+        mock_get_ec_transfer,
+        _mock_has_kv_transfer_group,
+    ):
+        runner = self._build_runner()
+        runner.encoder_cache = {}
+        scheduler_output = SimpleNamespace(ec_connector_metadata=None)
+
+        output = runner._no_forward_output(scheduler_output)
+
+        self.assertIs(output, EMPTY_MODEL_RUNNER_OUTPUT)
+        mock_get_ec_transfer.assert_not_called()
 
 
 class TestCorrectOptimisticSeqLensCpu(unittest.TestCase):

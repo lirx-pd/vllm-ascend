@@ -10,7 +10,7 @@ clusters:
   • decode  (language-model inference)
 
 For MM input we:
-    1. Extract *every* image/audio item.
+    1. Extract *every* image/audio/video item.
     2. Fire N concurrent requests to the encoder cluster
        (one request per item, with **all text removed**).
     3. Wait for all of them to succeed.
@@ -21,17 +21,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import copy
+import hashlib
+import itertools
+import json
 import logging
 import os
 import random
+import time
 import uuid
 from collections.abc import AsyncIterator
-from enum import Enum
 
 import aiohttp
 import uvicorn
-from aiohttp import ClientResponse
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -39,7 +40,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # FastAPI app & global state
 ###############################################################################
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger("proxy")
 
 app = FastAPI()
@@ -47,22 +48,92 @@ encode_session: aiohttp.ClientSession | None = None
 prefill_session: aiohttp.ClientSession | None = None
 decode_session: aiohttp.ClientSession | None = None
 
+# Cursor for round-robin encoder assignment, shared across requests so the
+# fan-out doesn't restart from e_urls[0] every time.
+encoder_rr_idx = 0
+encoder_rr_lock = asyncio.Lock()
+
 ###############################################################################
 # Utils
 ###############################################################################
 
 
-MM_TYPES = {"image_url", "audio_url", "input_audio"}
+MM_TYPES = {"image_url", "audio_url", "input_audio", "video_url"}
 
 
-class EncoderDispatchMode(str, Enum):
-    SINGLE = "single"
-    FANOUT = "fanout"
+def encoder_rr_assignment(e_urls: list[str], start: int, count: int) -> tuple[list[str], int]:
+    """Assign `count` items to encoder URLs starting from cursor `start`.
+
+    Returns the per-item URL list and the cursor value the next call should
+    start from, so the assignment is contiguous across calls instead of
+    restarting at e_urls[0] every time.
+    """
+    urls = [e_urls[(start + i) % len(e_urls)] for i in range(count)]
+    next_start = (start + count) % len(e_urls)
+    return urls, next_start
+
+
+# Diagnostic switch: forward the original request to the decoder so the
+# only difference from the rewrite path is the rewrite itself.
+NO_REWRITE = False
+# Decode-side retries for a retryable internal error (`finish_reason="error"`,
+# e.g. an encoder embedding the connector could not deliver). Re-issuing runs
+# the encode again, which produces a fresh transfer.
+DECODE_RETRIES = 1
+
+
+def content_uuid(item: dict) -> str:
+    """Cache key for a multimodal item, derived from its content.
+
+    Must be content-derived, not request-derived: the EC cache is keyed by this
+    value, so a per-request key (a request id, say) would make every request a
+    miss and throw away cross-request reuse of already-encoded media -- while
+    the unmodified path, which hashes the content, would keep it. That asymmetry
+    silently biases any comparison between the two.
+    """
+    url = (item.get("image_url") or item.get("audio_url") or item.get("video_url") or {}).get("url") or ""
+    payload = url or json.dumps(item, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def rewrite_for_decode(req_data: dict, item_meta: dict[int, dict]) -> dict:
+    """Preserve media and attach the identity used by the encoder's EC push.
+
+    The pinned vLLM requires media to derive placeholders: it does not support
+    metadata-only embedding inputs. CPU preprocessing must use the producer's
+    UUID so the consumer can load its NPU embedding through Mooncake.
+    """
+    transfer_items = []
+    idx = 0
+    new_messages = []
+    for msg in req_data.get("messages", []):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            new_messages.append(msg)
+            continue
+        new_content = []
+        for item in content:
+            if item.get("type") not in MM_TYPES:
+                new_content.append(item)
+                continue
+            meta = item_meta[idx]
+            idx += 1
+            item_uuid = meta["mm_hash"]
+            new_content.append({**item, "uuid": item_uuid})
+            transfer_items.append({"mm_hash": item_uuid, "transfer_id": meta["transfer_id"]})
+        new_messages.append({**msg, "content": new_content})
+
+    if not transfer_items:
+        return req_data
+    logger.info("Attached EC identities to %d media item(s)", len(transfer_items))
+    ec_transfer_params = dict(req_data.get("ec_transfer_params") or {})
+    ec_transfer_params["ec_items"] = transfer_items
+    return {**req_data, "messages": new_messages, "ec_transfer_params": ec_transfer_params}
 
 
 def extract_mm_items(request_data: dict) -> list[dict]:
     """
-    Return *all* image/audio items that appear anywhere in `messages`.
+    Return *all* image/audio/video items that appear anywhere in `messages`.
 
     Each returned dict looks like:
         { "type": "image_url", "image_url": {...} }
@@ -79,42 +150,74 @@ def extract_mm_items(request_data: dict) -> list[dict]:
     return items
 
 
-async def _encode_fanout(
+async def fanout_encoder_primer(
     orig_request: dict,
     e_urls: list[str],
     req_id: str,
-):
+    consumer_zmq: str | None = None,
+) -> dict[int, dict]:
+    """
+    1. Build one request *per MM item* with all text removed.
+    2. Send them concurrently to the encode cluster.
+    3. Raise if any of them fails.
+
+    Return the EC identity sent to each encoder, independent of whether its
+    response contains grid metadata. Both sides must use the same cache key.
+    """
     logger.info("[%s] Processing multimodal items...", req_id)
 
     mm_items = extract_mm_items(orig_request)
     if not mm_items:
         logger.info("[%s] No multimodal items, skipping encoder", req_id)
-        return  # nothing to do
+        return {}  # nothing to do
 
     logger.info("[%s] got %d multimodal items...", req_id, len(mm_items))
 
     tasks = []
+    item_uuids: dict[int, str] = {}
+    item_transfer_ids: dict[int, str] = {}
+    item_meta: dict[int, dict] = {}
 
-    # Round-robin over encode servers to distribute load a bit
-    url_cycle = (e_urls[i % len(e_urls)] for i in range(len(mm_items)))
+    # Round-robin over encode servers to distribute load a bit. The cursor
+    # persists across requests so fan-out doesn't restart at e_urls[0] every
+    # time (which would hot-spot the first encoder for single-item requests).
+    global encoder_rr_idx
+    async with encoder_rr_lock:
+        url_cycle, encoder_rr_idx = encoder_rr_assignment(e_urls, encoder_rr_idx, len(mm_items))
 
     for idx, (item, target_url) in enumerate(zip(mm_items, url_cycle)):
         # Derive a *child* request id:  <parent>:<index>:<random-short>
         child_req_id = f"{req_id}:{idx}:{uuid.uuid4().hex[:6]}"
         headers = {"x-request-id": child_req_id}
 
+        # With --no-rewrite the decoder still receives the raw image and derives
+        # the cache key by hashing it, so the encoder must do the same -- passing
+        # a uuid here would make the two disagree and silently defeat the EC
+        # transfer, leaving the decoder to encode the image itself.
+        item_uuid = None if NO_REWRITE else content_uuid(item)
+        if item_uuid is not None:
+            item_uuids[idx] = item_uuid
+        transfer_id = uuid.uuid4().hex
+        item_transfer_ids[idx] = transfer_id
+
         encoder_req = {
             # You *may* need to keep additional fields
             "model": orig_request.get("model"),
             "messages": [
-                {"role": "user", "content": [item]},
+                {
+                    "role": "user",
+                    "content": [item if item_uuid is None else {**item, "uuid": item_uuid}],
+                },
             ],
-            # Only need 1 token so the server actually runs the encoder path
-            "max_tokens": 1,
+            # No max_tokens cap: the encoder instance never samples, it finishes
+            # once the prompt is encoded; the EC push completes asynchronously.
             "stream": False,
         }
-        if encode_session is None:
-            raise HTTPException(status_code=500, detail="Encode session not initialized")
+        if consumer_zmq is not None:
+            encoder_req["ec_transfer_params"] = {
+                "consumer_zmq": consumer_zmq,
+                "ec_items": [{"mm_hash": item_uuid, "transfer_id": transfer_id}],
+            }
         tasks.append(
             encode_session.post(
                 f"{target_url}/v1/chat/completions",
@@ -135,95 +238,35 @@ async def _encode_fanout(
                 r,
                 exc_info=r,
             )
-            error_detail = str(r)
-            if hasattr(r, "status"):
-                error_detail = f"Status: {r.status}, Error: {error_detail}"
-            elif hasattr(r, "status_code"):
-                error_detail = f"Status: {r.status_code}, Error: {error_detail}"
-            raise HTTPException(status_code=502, detail=f"Encoder request failed: {error_detail}")
-        if isinstance(r, ClientResponse):
-            if hasattr(r, "status") and r.status != 200:
-                try:
-                    detail = await r.text()
-                except Exception:
-                    detail = "<unable to read body>"
-                logger.error(
-                    "[%s] Encoder request #%d returned status %s: %s",
-                    req_id,
-                    idx,
-                    r.status,
-                    detail,
-                )
-                raise HTTPException(
-                    status_code=r.status,
-                    detail=f"Encoder request failed: {detail}",
-                )
+            raise HTTPException(status_code=502, detail=f"Encoder request failed: {str(r)}")
+        if r.status != 200:
+            try:
+                detail = await r.text()
+            except Exception:
+                detail = "<unable to read body>"
+            logger.error(
+                "[%s] Encoder request #%d returned status %s: %s",
+                req_id,
+                idx,
+                r.status,
+                detail,
+            )
+            raise HTTPException(
+                status_code=r.status,
+                detail=f"Encoder request failed: {detail}",
+            )
+
+        # Drain the response before reusing the connection. The proxy already
+        # knows the identity sent to the encoder; grid metadata is not needed.
+        await r.read()
+        if idx in item_uuids:
+            item_meta[idx] = {
+                "mm_hash": item_uuids[idx],
+                "transfer_id": item_transfer_ids[idx],
+            }
 
     logger.info("[%s] All %d encoder requests completed successfully", req_id, len(mm_items))
-
-
-async def _encode_single_request(
-    orig_request: dict,
-    e_url: str,
-    req_id: str,
-) -> None:
-    """
-    1. Build one request *per MM item* with all text removed.
-    2. Send them concurrently to the encode cluster.
-    3. Raise if any of them fails.
-    """
-    logger.info("[%s] Processing multimodal items...", req_id)
-
-    request_data = copy.deepcopy(orig_request)
-    headers = {"x-request-id": req_id}
-    request_data["max_tokens"] = 1
-    request_data["stream"] = False
-    request_data.pop("stream_options", None)
-    if "max_completion_tokens" in request_data:
-        request_data["max_completion_tokens"] = 1
-
-    try:
-        if encode_session is None:
-            raise HTTPException(status_code=500, detail="Encode session not initialized")
-
-        encode_response = await encode_session.post(f"{e_url}/v1/chat/completions", json=request_data, headers=headers)
-        encode_response.raise_for_status()
-
-        if encode_response.status != 200:
-            encode_text = await encode_response.text()
-            raise HTTPException(
-                status_code=encode_response.status,
-                detail={"error": "Encoder request failed", "message": encode_text},
-            )
-        logger.debug("Encoder processing completed successfully for req_id: %s", req_id)
-
-        return encode_response
-
-    except Exception as e:
-        logger.error("Encoder processing failed: %s", str(e))
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "Encoder processing error", "message": str(e)},
-        ) from e
-
-    logger.info("[%s] Encoder request completed successfully", req_id)
-
-
-async def fanout_encoder_primer(
-    orig_request: dict,
-    req_id: str,
-):
-    mode = app.state.encoder_dispatch_mode
-
-    if mode == EncoderDispatchMode.SINGLE:
-        e_url = random.choice(app.state.e_urls)
-        await _encode_single_request(orig_request, e_url, req_id)
-
-    elif mode == EncoderDispatchMode.FANOUT:
-        await _encode_fanout(orig_request, app.state.e_urls, req_id)
-
-    else:
-        raise RuntimeError(f"Unknown encoder dispatch mode: {mode}")
+    return item_meta
 
 
 async def maybe_prefill(
@@ -240,12 +283,12 @@ async def maybe_prefill(
         logger.info("[%s] Processing through prefill: %s", req_id, p_url)
 
         prefill_response = await process_prefill_stage(req_data, p_url, req_id)
-        if isinstance(prefill_response, ClientResponse):
-            # for nixl connector to facilitate kv transfer...
-            prefill_response_json = await prefill_response.json()
-            kv_transfer_params = prefill_response_json.get("kv_transfer_params", {})
-            if kv_transfer_params:
-                req_data["kv_transfer_params"] = kv_transfer_params
+        # for nixl connector to facilitate kv transfer...
+        prefill_response_json = await prefill_response.json()
+        kv_transfer_params = prefill_response_json.get("kv_transfer_params", {})
+        if kv_transfer_params:
+            req_data["kv_transfer_params"] = kv_transfer_params
+
         return req_data
     else:
         return req_data
@@ -255,7 +298,7 @@ async def process_prefill_stage(
     req_data: dict,
     p_url: str,
     req_id: str,
-) -> ClientResponse:
+) -> dict:
     """Process request through Prefill stage and return kv_transfer_params"""
     logger.info("[%s] Sending prefill request to: %s", req_id, p_url)
 
@@ -277,9 +320,6 @@ async def process_prefill_stage(
 
     headers = {"x-request-id": req_id}
     try:
-        if prefill_session is None:
-            raise HTTPException(status_code=500, detail="Prefill session not initialized")
-
         prefill_response = await prefill_session.post(
             f"{p_url}/v1/chat/completions", json=prefill_request, headers=headers
         )
@@ -309,24 +349,11 @@ async def process_prefill_stage(
         ) from e
 
 
-def has_mm_input(request_data: dict):
-    if "messages" not in request_data:
-        return False
-    for message in request_data["messages"]:
-        if not isinstance(message.get("content"), list):
-            continue
-        for content_item in message["content"]:
-            if content_item.get("type") in ["image_url", "audio_url", "input_audio"]:
-                return True
-    return False
-
-
 ###############################################################################
 # Middleware for request/response logging
 ###############################################################################
 
 
-@app.middleware("http")
 async def log_requests(request: Request, call_next):
     """Middleware to log all incoming requests and responses"""
     req_id = request.headers.get("x-request-id", str(uuid.uuid4()))
@@ -375,7 +402,7 @@ async def log_requests(request: Request, call_next):
 async def on_startup() -> None:
     global encode_session, prefill_session, decode_session
     timeout = aiohttp.ClientTimeout(total=100_000)
-    connector = aiohttp.TCPConnector(limit=0, force_close=False, keepalive_timeout=0)
+    connector = aiohttp.TCPConnector(limit=0, force_close=False)
     encode_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
     if app.state.p_urls:
         # only setup if prefill instance(s) exist
@@ -399,35 +426,78 @@ async def on_shutdown() -> None:
 ###############################################################################
 
 
-async def forward_non_stream(req_data: dict, req_id: str, p_url: str, d_url: str) -> dict:
+async def prepare_for_decode(
+    req_data: dict,
+    req_id: str,
+    e_urls: list[str],
+    p_url: str,
+    consumer_zmq: str | None,
+) -> tuple[dict, float, float]:
+    """Encode, attach EC identities and prefill without mutating the request."""
+    _t0 = time.perf_counter()
+    item_meta = await fanout_encoder_primer(req_data, e_urls, req_id, consumer_zmq)
+    _t1 = time.perf_counter()
+    prepared = req_data if NO_REWRITE else rewrite_for_decode(req_data, item_meta)
+    _t2 = time.perf_counter()
+    prepared = await maybe_prefill(prepared, p_url, req_id)
+    return prepared, _t1 - _t0, _t2 - _t1
+
+
+async def forward_non_stream(
+    req_data: dict,
+    req_id: str,
+    e_urls: list[str],
+    p_url: str,
+    d_url: str,
+    consumer_zmq: str | None,
+    dp_rank: int | None = None,
+) -> dict:
     try:
-        # Step 1: Process through Encoder instance (if has MM input)
-        async def run_encoder():
-            await fanout_encoder_primer(req_data, req_id)
+        for attempt in range(DECODE_RETRIES + 1):
+            _t0 = time.perf_counter()
+            prepared, encode_s, rewrite_s = await prepare_for_decode(req_data, req_id, e_urls, p_url, consumer_zmq)
+            _t2 = time.perf_counter()
 
-        if has_mm_input(req_data):
-            await non_stream_retry_wrap(run_encoder)
-
-        # Step 2: Process through Prefill instance
-        async def run_prefill():
-            return await maybe_prefill(req_data, p_url, req_id)
-
-        req_data = await non_stream_retry_wrap(run_prefill)
-
-        async def run_decode_non_stream():
-            # Step 3: Process through Decode instance
             logger.info("[%s] Forwarding to decode: %s", req_id, d_url)
             headers = {"x-request-id": req_id}
+            if dp_rank is not None:
+                headers["X-data-parallel-rank"] = str(dp_rank)
 
-            # Non-streaming response
-            if decode_session is None:
-                raise HTTPException(status_code=500, detail="Decode session not initialized")
-
-            async with decode_session.post(f"{d_url}/v1/chat/completions", json=req_data, headers=headers) as resp:
-                resp.raise_for_status()
-                return await resp.json()
-
-        return await non_stream_retry_wrap(run_decode_non_stream)
+            async with decode_session.post(f"{d_url}/v1/chat/completions", json=prepared, headers=headers) as resp:
+                if resp.status >= 400:
+                    detail = await resp.text()
+                    # 500 is the decoder's retryable internal error, which
+                    # includes an encoder embedding it could not obtain. Redoing
+                    # the encode publishes the item again.
+                    if resp.status == 500 and attempt < DECODE_RETRIES:
+                        logger.warning(
+                            "[%s] Decode returned 500, re-encoding and retrying (attempt %d/%d): %s",
+                            req_id,
+                            attempt + 1,
+                            DECODE_RETRIES,
+                            detail[:200],
+                        )
+                        continue
+                    logger.error(
+                        "[%s] Decode request returned status %s: %s",
+                        req_id,
+                        resp.status,
+                        detail,
+                    )
+                    raise HTTPException(status_code=resp.status, detail=detail)
+                out = await resp.json()
+                _t3 = time.perf_counter()
+                logger.info(
+                    "STAGE %s encode=%.1f rewrite=%.1f decode=%.1f total=%.1f attempt=%d",
+                    "no-rewrite" if NO_REWRITE else "rewrite",
+                    encode_s * 1e3,
+                    rewrite_s * 1e3,
+                    (_t3 - _t2) * 1e3,
+                    (_t3 - _t0) * 1e3,
+                    attempt,
+                )
+                return out
+        raise HTTPException(status_code=500, detail="Decode failed after re-encoding")
 
     except HTTPException:
         raise
@@ -436,88 +506,63 @@ async def forward_non_stream(req_data: dict, req_id: str, p_url: str, d_url: str
         raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}") from e
 
 
-async def stream_retry_wrap(forward_func, max_retries: int = 3, delay: float = 0.001):
-    last_exc = None
-    first_chunk_sent = False
-    for attempt in range(max_retries):
-        try:
-            async for chunk in forward_func():
-                first_chunk_sent = True
-                yield chunk
-            return
-        except Exception as e:
-            if first_chunk_sent:
-                raise
-            if isinstance(e, HTTPException) and e.status_code < 500:
-                raise
-            last_exc = e
-            logger.warning(
-                "attempt %s / %s failed retrying... ",
-                attempt + 1,
-                max_retries,
-            )
-            await asyncio.sleep(delay * (attempt + 1))
-
-    raise RuntimeError(f"all {max_retries} retries failed.") from last_exc
-
-
-async def non_stream_retry_wrap(forward_func, max_retries: int = 3, delay: float = 0.001):
-    last_exc = None
-    for attempt in range(max_retries):
-        try:
-            result = await forward_func()
-            return result
-        except Exception as e:
-            if isinstance(e, HTTPException) and e.status_code < 500:
-                raise
-            last_exc = e
-            logger.warning(
-                "attempt %s / %s failed retrying... ",
-                attempt + 1,
-                max_retries,
-            )
-            await asyncio.sleep(delay * (attempt + 1))
-    raise RuntimeError(f"all {max_retries} retries failed.") from last_exc
-
-
-async def forward_stream(req_data: dict, req_id: str, p_url: str, d_url: str) -> AsyncIterator[str]:
+async def forward_stream(
+    req_data: dict,
+    req_id: str,
+    e_urls: list[str],
+    p_url: str,
+    d_url: str,
+    consumer_zmq: str | None,
+    dp_rank: int | None = None,
+) -> AsyncIterator[str]:
     try:
-        # Step 1: Process through Encoder instance (if has MM input)
-        async def run_encoder():
-            await fanout_encoder_primer(req_data, req_id)
+        for attempt in range(DECODE_RETRIES + 1):
+            _t0 = time.perf_counter()
+            prepared, encode_s, rewrite_s = await prepare_for_decode(req_data, req_id, e_urls, p_url, consumer_zmq)
+            _t2 = time.perf_counter()
 
-        if has_mm_input(req_data):
-            await non_stream_retry_wrap(run_encoder)
-
-        # Step 2: Process through Prefill instance
-        async def run_prefill():
-            return await maybe_prefill(req_data, p_url, req_id)
-
-        req_data = await non_stream_retry_wrap(run_prefill)
-
-        async def run_decode_stream():
-            # Step 3: Process through Decode instance
             logger.info("[%s] Starting streaming from decode: %s", req_id, d_url)
             headers = {"x-request-id": req_id}
+            if dp_rank is not None:
+                headers["X-data-parallel-rank"] = str(dp_rank)
 
-            # Streaming response
-            if decode_session is None:
-                raise HTTPException(status_code=500, detail="Decode session not initialized")
-
+            _first = None
             async with decode_session.post(
                 f"{d_url}/v1/chat/completions",
-                json=req_data,
+                json=prepared,
                 headers=headers,
             ) as resp:
+                # Retry only before the first chunk: once anything reached the
+                # client the response cannot be replaced.
+                if resp.status == 500 and attempt < DECODE_RETRIES:
+                    detail = await resp.text()
+                    logger.warning(
+                        "[%s] Decode returned 500 before streaming, re-encoding and retrying (attempt %d/%d): %s",
+                        req_id,
+                        attempt + 1,
+                        DECODE_RETRIES,
+                        detail[:200],
+                    )
+                    continue
                 resp.raise_for_status()
                 async for chunk in resp.content.iter_chunked(1024):
                     if chunk:
+                        if _first is None:
+                            _first = time.perf_counter()
                         yield chunk.decode("utf-8", errors="ignore")
+            _t3 = time.perf_counter()
 
+            logger.info(
+                "STAGE %s encode=%.1f rewrite=%.2f decode_ttfb=%.1f decode_total=%.1f attempt=%d",
+                "no-rewrite" if NO_REWRITE else "rewrite",
+                encode_s * 1e3,
+                rewrite_s * 1e3,
+                ((_first or _t3) - _t2) * 1e3,
+                (_t3 - _t2) * 1e3,
+                attempt,
+            )
             logger.info("[%s] Streaming completed", req_id)
-
-        async for chunk in stream_retry_wrap(run_decode_stream):
-            yield chunk
+            return
 
     except HTTPException:
         logger.exception("[%s] HTTPException in forward_stream", req_id)
@@ -538,17 +583,27 @@ async def chat_completions(request: Request):
         req_data = await request.json()
         req_id = request.headers.get("x-request-id", str(uuid.uuid4()))
 
+        e_urls = app.state.e_urls  # we want the full list for fan-out
         p_url = random.choice(app.state.p_urls) if app.state.p_urls else None
-        d_url = random.choice(app.state.d_urls)
+        decode_index = random.randrange(len(app.state.d_urls))
+        d_url = app.state.d_urls[decode_index]
+        dp_size = app.state.ec_consumer_dp_size
+        # Round-robin the replica, then name it to both halves: the decoder
+        # honours the rank header instead of its own balancer, and the encoder
+        # pushes to that replica's control channel. Choosing once here means a
+        # decode retry re-encodes to the same replica.
+        dp_rank = next(app.state.replica_counter) % dp_size if dp_size > 1 else None
+        ec_index = decode_index * dp_size + (dp_rank or 0)
+        consumer_zmq = app.state.d_ec_urls[ec_index] if app.state.d_ec_urls else None
 
         is_streaming = req_data.get("stream", False)
 
         if is_streaming:
             return StreamingResponse(
-                forward_stream(req_data, req_id, p_url, d_url),
+                forward_stream(req_data, req_id, e_urls, p_url, d_url, consumer_zmq, dp_rank),
                 media_type="text/event-stream",
             )
-        result = await forward_non_stream(req_data, req_id, p_url, d_url)
+        result = await forward_non_stream(req_data, req_id, e_urls, p_url, d_url, consumer_zmq, dp_rank)
         return JSONResponse(content=result)
 
     except HTTPException:
@@ -560,8 +615,6 @@ async def chat_completions(request: Request):
 
 @app.get("/v1/models")
 async def list_models():
-    if decode_session is None:
-        raise HTTPException(status_code=500, detail="Decode session not initialized")
     async with decode_session.get(f"{app.state.d_urls[0]}/v1/models") as resp:
         resp.raise_for_status()
         return await resp.json()
@@ -569,13 +622,13 @@ async def list_models():
 
 @app.get("/health")
 async def health_check():
-    async def healthy(urls, session):
+    async def healthy(session, urls):
         if not urls:
             return "empty"
+        if session is None:
+            return "unhealthy"
         for u in urls:
             try:
-                if session is None:
-                    return "unhealthy"
                 async with session.get(f"{u}/health") as resp:
                     resp.raise_for_status()
             except Exception:
@@ -583,9 +636,9 @@ async def health_check():
         return "healthy"
 
     e_status, p_status, d_status = await asyncio.gather(
-        healthy(app.state.e_urls, encode_session),
-        healthy(app.state.p_urls, prefill_session),
-        healthy(app.state.d_urls, decode_session),
+        healthy(encode_session, app.state.e_urls),
+        healthy(prefill_session, app.state.p_urls),
+        healthy(decode_session, app.state.d_urls),
     )
 
     overall_healthy = all(status != "unhealthy" for status in (e_status, p_status, d_status))
@@ -624,8 +677,6 @@ async def _post_if_available(
     • Raises for anything else.
     """
     try:
-        if session is None:
-            return None
         resp = await session.post(url, json=payload, headers=headers)
         if resp.status == 404:  # profiling disabled on that server
             logger.warning("Profiling endpoint missing on %s", url)
@@ -698,6 +749,19 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
+        "--log-requests",
+        action="store_true",
+        help=(
+            "Log every request in and out, and raise the log level to DEBUG. "
+            "Off by default: the proxy is on the request path."
+        ),
+    )
+    parser.add_argument(
+        "--no-rewrite",
+        action="store_true",
+        help="Forward media unchanged without explicit EC identities (for stage-timing A/B).",
+    )
+    parser.add_argument(
         "--encode-servers-urls",
         required=True,
         help='Comma-separated encode URLs ("http://e1:8001,http://e2:8001")',
@@ -705,25 +769,68 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prefill-servers-urls",
         required=True,
-        help='Comma-separated prefill URLs ("http://p1:8003,http://p2:8004") to enable E->P->D, '
-        'set "disable" or "none" to enable E->PD',
+        help=(
+            'Comma-separated prefill URLs ("http://p1:8003,http://p2:8004") '
+            'to enable E->P->D, set "disable" or "none" to enable E->PD'
+        ),
     )
     parser.add_argument(
         "--decode-servers-urls",
         required=True,
         help='Comma-separated decode URLs ("http://d1:8005,http://d2:8006")',
     )
-
     parser.add_argument(
-        "--encoder-dispatch-mode",
-        choices=["single", "fanout"],
-        default="single",
-        help="Encoder dispatch mode: single (one request) or fanout (per-MM-item)",
+        "--decode-retries",
+        type=int,
+        default=1,
+        help=(
+            "Re-encode and re-send when decode returns 500, which is its "
+            "retryable internal error (an undeliverable encoder embedding "
+            "among them). 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--ec-consumer-zmq-addrs",
+        default="",
+        help=(
+            "Comma-separated Mooncake EC consumer control addresses, aligned "
+            "with --decode-servers-urls. Required when the consumers use the "
+            "Mooncake EC connector. With --ec-consumer-dp-size > 1, list each "
+            "server's replicas consecutively: s0r0,s0r1,s1r0,s1r1."
+        ),
+    )
+    parser.add_argument(
+        "--ec-consumer-dp-size",
+        type=int,
+        default=1,
+        help=(
+            "Data-parallel replicas per EC consumer. The proxy picks a replica "
+            "round-robin and names it to both halves of the request, because an "
+            "encoder push has to land where the request will run."
+        ),
     )
 
     args = parser.parse_args()
+    if args.log_requests:
+        logging.getLogger().setLevel(logging.DEBUG)
+        app.middleware("http")(log_requests)
+    NO_REWRITE = args.no_rewrite
+    DECODE_RETRIES = max(0, args.decode_retries)
     app.state.e_urls = [u.strip() for u in args.encode_servers_urls.split(",") if u.strip()]
     app.state.d_urls = [u.strip() for u in args.decode_servers_urls.split(",") if u.strip()]
+    app.state.d_ec_urls = [u.strip() for u in args.ec_consumer_zmq_addrs.split(",") if u.strip()]
+    if args.ec_consumer_dp_size < 1:
+        parser.error("--ec-consumer-dp-size must be at least 1")
+    app.state.ec_consumer_dp_size = args.ec_consumer_dp_size
+    app.state.replica_counter = itertools.count()
+    expected = len(app.state.d_urls) * args.ec_consumer_dp_size
+    if app.state.d_ec_urls and len(app.state.d_ec_urls) != expected:
+        parser.error(
+            "--ec-consumer-zmq-addrs must contain one address per consumer "
+            f"replica: expected {expected} "
+            f"({len(app.state.d_urls)} servers x {args.ec_consumer_dp_size} replicas), "
+            f"got {len(app.state.d_ec_urls)}"
+        )
     # handle prefill instances
     if args.prefill_servers_urls.lower() in ("disable", "none", ""):
         app.state.p_urls = []
@@ -732,12 +839,16 @@ if __name__ == "__main__":
         app.state.p_urls = [u.strip() for u in args.prefill_servers_urls.split(",") if u.strip()]
         logger.info("Disaggregated prefill phase is enabled. Running E + P + D...")
 
-    app.state.encoder_dispatch_mode = EncoderDispatchMode(args.encoder_dispatch_mode)
-
     logger.info("Proxy listening on %s:%s", args.host, args.port)
     logger.info("Encode servers: %s", app.state.e_urls)
     logger.info("Prefill instances %s", app.state.p_urls)
     logger.info("Decode servers: %s", app.state.d_urls)
+    if app.state.ec_consumer_dp_size > 1:
+        logger.info(
+            "EC consumer replicas per server: %d (control addresses: %s)",
+            app.state.ec_consumer_dp_size,
+            app.state.d_ec_urls,
+        )
 
     uvicorn.run(
         app,

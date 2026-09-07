@@ -1,7 +1,7 @@
 import importlib
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig, ProfilerConfig, VllmConfig
@@ -1564,6 +1564,29 @@ class TestNPUWorker(TestBase):
             # Verify calls
             worker.model_runner.load_model.assert_called_once()
 
+    @patch("vllm_ascend.worker.worker.get_ec_transfer")
+    @patch("vllm_ascend.worker.worker.has_ec_transfer", return_value=True)
+    def test_load_model_starts_ec_worker_services(self, _mock_has_ec_transfer, mock_get_ec_transfer):
+        """EC services start only after model loading completes."""
+        from vllm_ascend.worker.worker import NPUWorker
+
+        calls = MagicMock()
+        connector = MagicMock()
+        calls.attach_mock(connector.start_worker_services, "start_services")
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.model_runner = MagicMock()
+            calls.attach_mock(worker.model_runner.load_model, "load_model")
+            worker.vllm_config = MagicMock()
+            worker.vllm_config.model_config.enable_sleep_mode = False
+            worker.vllm_config.weight_transfer_config = None
+            mock_get_ec_transfer.return_value = connector
+
+            worker.load_model()
+
+        self.assertEqual(calls.mock_calls, [call.load_model(), call.start_services()])
+
     @patch("vllm_ascend.worker.worker.CaMemAllocator")
     def test_load_model_sleep_mode_assertion_error(self, mock_allocator_class):
         """Test load_model method - assertion error in sleep mode"""
@@ -2177,3 +2200,19 @@ class TestNPUWorkerWeightUpdate(TestBase):
         worker.shutdown()
 
         engine.shutdown.assert_called_once()
+
+    @patch("vllm_ascend.worker.worker.ensure_kv_transfer_shutdown")
+    @patch("vllm_ascend.worker.worker.ensure_ec_transfer_shutdown")
+    def test_shutdown_stops_ec_before_kv(self, mock_ec_shutdown, mock_kv_shutdown):
+        lifecycle = MagicMock()
+        lifecycle.attach_mock(mock_ec_shutdown, "ec")
+        lifecycle.attach_mock(mock_kv_shutdown, "kv")
+        worker = self._make_worker()
+        worker.profiler = None
+
+        worker.shutdown()
+
+        self.assertEqual(
+            lifecycle.mock_calls[:2],
+            [call.ec(), call.kv()],
+        )

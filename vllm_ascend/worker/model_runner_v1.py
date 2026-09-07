@@ -386,6 +386,15 @@ class NPUModelRunner(GPUModelRunner):
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
         self.use_score_encoder_cache = is_score_encoder_cache_manager(self.vllm_config)
+        ec_transfer_config = self.vllm_config.ec_transfer_config
+        if (
+            self.use_score_encoder_cache
+            and ec_transfer_config is not None
+            and ec_transfer_config.is_ec_transfer_instance
+        ):
+            raise NotImplementedError(
+                "EC transfer does not support ScoreEncoderCacheManager on Model Runner V1."
+            )
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
@@ -662,6 +671,71 @@ class NPUModelRunner(GPUModelRunner):
         self.cpu_encoder_cache.clear()
         self.cached.clear()
         self._pending_encoder_cache_copies.clear()
+
+    @staticmethod
+    def maybe_get_ec_connector_output(
+        scheduler_output: "SchedulerOutput",
+        encoder_cache: dict[str, torch.Tensor],
+        **kwargs,
+    ):
+        if (
+            not has_ec_transfer()
+            or scheduler_output.ec_connector_metadata is None
+        ):
+            return nullcontext()
+        return NPUModelRunner._get_ec_connector_output(
+            scheduler_output,
+            encoder_cache,
+            **kwargs,
+        )
+
+    @staticmethod
+    @contextmanager
+    def _get_ec_connector_output(
+        scheduler_output: "SchedulerOutput",
+        encoder_cache: dict[str, torch.Tensor],
+        **kwargs,
+    ):
+        """Run the extended EC lifecycle missing from the pinned vLLM mixin."""
+        output = ECConnectorOutput()
+        connector = get_ec_transfer()
+        metadata = scheduler_output.ec_connector_metadata
+        if metadata is None:
+            raise RuntimeError("EC connector metadata is required")
+        connector.bind_connector_metadata(metadata)
+
+        if connector.is_producer:
+            connector.start_save_caches(encoder_cache=encoder_cache, **kwargs)
+        if connector.is_consumer:
+            connector.start_load_caches(encoder_cache, **kwargs)
+
+        try:
+            yield output
+        finally:
+            output.finished_sending, output.finished_recving = connector.get_finished(
+                scheduler_output.finished_req_ids
+            )
+            output.ec_connector_worker_meta = connector.build_connector_worker_meta()
+            connector.clear_connector_metadata()
+
+    def _no_forward_output(self, scheduler_output: "SchedulerOutput"):
+        output = (
+            self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+            if has_kv_transfer_group()
+            else EMPTY_MODEL_RUNNER_OUTPUT
+        )
+        if not has_ec_transfer():
+            return output
+        with self.maybe_get_ec_connector_output(
+            scheduler_output,
+            encoder_cache=self.encoder_cache,
+        ) as ec_connector_output:
+            pass
+        if ec_connector_output is None:
+            return output
+        output = copy(output)
+        output.ec_connector_output = ec_connector_output
+        return output
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
@@ -2218,7 +2292,12 @@ class NPUModelRunner(GPUModelRunner):
                     ) as ec_connector_output:
                         self._execute_mm_encoder(scheduler_output)
                         self._finalize_dump_data()
-                        return make_empty_encoder_model_runner_output(scheduler_output)
+                    output = copy(
+                        make_empty_encoder_model_runner_output(scheduler_output)
+                    )
+                    output.sampled_token_ids = [[] for _ in output.req_ids]
+                    output.ec_connector_output = ec_connector_output
+                    return output
 
                 if not num_scheduled_tokens:
                     if (
@@ -2232,10 +2311,7 @@ class NPUModelRunner(GPUModelRunner):
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
                         self._dummy_run(1, skip_gdn_state_update=True)
-                    if not has_kv_transfer_group():
-                        # Return empty ModelRunnerOutput if no work to do.
-                        return EMPTY_MODEL_RUNNER_OUTPUT
-                    return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    return self._no_forward_output(scheduler_output)
                 if self.cache_config.kv_sharing_fast_prefill:
                     assert not self.num_prompt_logprobs, (
                         "--kv-sharing-fast-prefill produces incorrect "
@@ -2248,9 +2324,7 @@ class NPUModelRunner(GPUModelRunner):
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 if (scheduler_output.total_num_scheduled_tokens <= 0
                         or not tokens or sum(tokens) == 0):
-                    if not has_kv_transfer_group():
-                        return EMPTY_MODEL_RUNNER_OUTPUT
-                    return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    return self._no_forward_output(scheduler_output)
                 self._start_dump_data(scheduled_tokens = scheduler_output.num_scheduled_tokens)
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())

@@ -71,9 +71,10 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -141,6 +142,8 @@ class BalanceScheduler(Scheduler):
                 long_max_wait_ms=short_request_first_config.long_max_wait_ms,
             )
         self._balance_enabled = _balance_scheduling_enabled(vllm_config)
+        ec_config = vllm_config.ec_transfer_config
+        self._ec_producer_only = bool(ec_config and ec_config.is_ec_producer and not ec_config.is_ec_consumer)
         # Injected by BalanceDPEngineCoreProc._has_global_unfinished_reqs
         # before the first gather. Only used on the enabled path (balance
         # requires DP > 1).
@@ -168,6 +171,31 @@ class BalanceScheduler(Scheduler):
             return
         running_tensor = torch.tensor([len(self.running)], dtype=torch.int, device="cpu")
         dist.all_gather(self.balance_queue, running_tensor, group=self.dp_group)
+
+    def _try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[int], int, int, list[int]]:
+        # The pinned scheduler only gates the first waiting prefill. This hook
+        # also covers running chunks and resumed requests when balance is off.
+        if (
+            num_new_tokens > 0
+            and request.has_encoder_inputs
+            and self.ec_connector is not None
+            and not self.ec_connector.ensure_cache_available(request, num_computed_tokens)
+        ):
+            return [], 0, encoder_compute_budget, []
+        return super()._try_schedule_encoder_inputs(
+            request,
+            num_computed_tokens,
+            num_new_tokens,
+            encoder_compute_budget,
+            shift_computed_tokens,
+        )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         if not self._balance_enabled:
@@ -243,6 +271,18 @@ class BalanceScheduler(Scheduler):
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
+                req_index += 1
+                continue
+
+            if (
+                self.ec_connector is not None
+                and request.mm_features
+                and not self.ec_connector.ensure_cache_available(
+                    request,
+                    request.num_computed_tokens - request.num_output_placeholders,
+                    self.encoder_cache_manager.cached.keys(),
+                )
+            ):
                 req_index += 1
                 continue
 
@@ -516,7 +556,11 @@ class BalanceScheduler(Scheduler):
                     if (
                         self.ec_connector is not None
                         and request.mm_features
-                        and not self.ec_connector.ensure_cache_available(request, num_computed_tokens)
+                        and not self.ec_connector.ensure_cache_available(
+                            request,
+                            num_computed_tokens,
+                            self.encoder_cache_manager.cached.keys(),
+                        )
                     ):
                         request_queue.pop_request()
                         step_skipped_waiting.prepend_request(request)
@@ -858,6 +902,66 @@ class BalanceScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def update_from_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> dict[int, EngineCoreOutputs]:
+        outputs = super().update_from_output(scheduler_output, model_runner_output)
+        connector = self.ec_connector
+        if connector is None:
+            return outputs
+
+        ec_connector_output = model_runner_output.ec_connector_output
+        if ec_connector_output is not None:
+            connector.update_connector_output(ec_connector_output)
+
+        # The pinned vLLM lacks its later encoder-only completion branch.
+        # Finish after the full prompt is consumed; Mooncake push stays async.
+        if self._ec_producer_only:
+            completed = []
+            sampled_token_ids = model_runner_output.sampled_token_ids
+            for req_id in scheduler_output.num_scheduled_tokens:
+                request = self.requests.get(req_id)
+                if request is None or request.is_finished():
+                    continue
+                req_index = model_runner_output.req_id_to_index[req_id]
+                if sampled_token_ids and sampled_token_ids[req_index]:
+                    continue
+                if request.num_computed_tokens >= request.num_prompt_tokens:
+                    completed.append(request)
+            for request in completed:
+                self.running.remove(request)
+                request.status = RequestStatus.FINISHED_STOPPED
+                _, ec_transfer_params = self._free_request(request)
+                output = EngineCoreOutput(
+                    request_id=request.request_id,
+                    new_token_ids=[],
+                    finish_reason=request.get_finished_reason(),
+                    events=request.take_events(),
+                    trace_headers=request.trace_headers,
+                    ec_transfer_params=ec_transfer_params,
+                )
+                client_outputs = outputs.setdefault(request.client_index, EngineCoreOutputs())
+                client_outputs.outputs.append(output)
+
+        unavailable_req_ids = connector.take_unavailable_requests()
+        if not unavailable_req_ids:
+            return outputs
+
+        error_reqs = self.finish_requests(unavailable_req_ids, RequestStatus.FINISHED_ERROR)
+        for request in error_reqs:
+            output = EngineCoreOutput(
+                request_id=request.request_id,
+                new_token_ids=[],
+                finish_reason=request.get_finished_reason(),
+                events=request.take_events(),
+                trace_headers=request.trace_headers,
+            )
+            client_outputs = outputs.setdefault(request.client_index, EngineCoreOutputs())
+            client_outputs.outputs.append(output)
+        return outputs
 
 
 class BalanceDPEngineCoreProc(DPEngineCoreProc):

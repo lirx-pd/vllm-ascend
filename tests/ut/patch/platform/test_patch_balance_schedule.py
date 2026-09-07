@@ -66,6 +66,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
+from vllm.v1.request import RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from tests.ut.kv_offload.utils import create_request, create_vllm_config
@@ -179,6 +180,7 @@ def test_balance_scheduler_installs_short_request_first_queue(monkeypatch, balan
     ):
         scheduler = BalanceScheduler(
             SimpleNamespace(
+                ec_transfer_config=None,
                 additional_config={},
                 parallel_config=SimpleNamespace(data_parallel_size=1),
             ),
@@ -215,6 +217,7 @@ def test_balance_scheduler_does_not_import_sfr_when_disabled(monkeypatch):
     ):
         scheduler = BalanceScheduler(
             SimpleNamespace(
+                ec_transfer_config=None,
                 additional_config={},
                 parallel_config=SimpleNamespace(data_parallel_size=1),
             ),
@@ -627,3 +630,56 @@ def test_upstream_scheduler_seams_still_exist():
         "all-reduce. It MUST be called every non-idle iteration by run_busy_loop "
         "(incl. dummy-batch) or the all_gather deadlocks."
     )
+
+
+def test_ec_consumer_does_not_cancel_load_when_prompt_releases_encoder_input():
+    # Worker load completion is applied after the base scheduler frees processed
+    # encoder inputs. An override here would cancel the LOADING transfer before
+    # update_connector_output can promote it to READY/RESIDENT.
+    assert "_free_encoder_inputs" not in BalanceScheduler.__dict__
+
+
+def test_ec_producer_request_finishes_after_encoder_step(monkeypatch):
+    request = MagicMock()
+    request.request_id = "encoder"
+    request.client_index = 0
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 0
+    request.num_prompt_tokens = 4
+    request.trace_headers = None
+    request.is_finished.return_value = False
+    request.get_finished_reason.return_value = "stop"
+    request.take_events.return_value = []
+
+    scheduler = BalanceScheduler.__new__(BalanceScheduler)
+    scheduler._ec_producer_only = True
+    scheduler.requests = {"encoder": request}
+    scheduler.running = [request]
+    scheduler.ec_connector = MagicMock()
+    scheduler.ec_connector.take_unavailable_requests.return_value = set()
+    ec_transfer_params = {"ec_items": [{"mm_hash": "image"}]}
+    scheduler._free_request = MagicMock(return_value=(None, ec_transfer_params))
+
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"encoder": 4})
+    worker_meta = object()
+    model_runner_output = SimpleNamespace(
+        sampled_token_ids=[[]],
+        req_id_to_index={"encoder": 0},
+        ec_connector_output=worker_meta,
+    )
+
+    def fake_update(_self, _scheduler_output, _model_runner_output):
+        request.num_computed_tokens = 4
+        return {}
+
+    monkeypatch.setattr(_UpstreamScheduler, "update_from_output", fake_update)
+    outputs = scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    assert scheduler.running == []
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    scheduler._free_request.assert_called_once_with(request)
+    scheduler.ec_connector.update_connector_output.assert_called_once_with(worker_meta)
+    output = outputs[0].outputs[0]
+    assert output.request_id == "encoder"
+    assert output.new_token_ids == []
+    assert output.ec_transfer_params == ec_transfer_params

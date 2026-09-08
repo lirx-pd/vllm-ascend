@@ -30,6 +30,7 @@ import random
 import time
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import contextmanager
 
 import aiohttp
 import uvicorn
@@ -80,6 +81,62 @@ NO_REWRITE = False
 # e.g. an encoder embedding the connector could not deliver). Re-issuing runs
 # the encode again, which produces a fresh transfer.
 DECODE_RETRIES = 1
+
+
+PROFILE_ENABLED = False
+
+
+def log_timing(stage: str, request_id: str, duration_s: float, **fields) -> None:
+    if PROFILE_ENABLED:
+        logger.info(
+            "NPU_EPD_TIMING %s",
+            json.dumps(dict(component="proxy", stage=stage, request_id=request_id, duration_s=duration_s, **fields)),
+        )
+
+
+@contextmanager
+def profile_stage(stage: str, request_id: str, **fields):
+    if not PROFILE_ENABLED:
+        yield fields
+        return
+    started = time.perf_counter()
+    fields["status"] = "ok"
+    try:
+        yield fields
+    except BaseException as exc:
+        fields["status"] = "cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error"
+        fields["error_type"] = type(exc).__name__
+        raise
+    finally:
+        ended = time.perf_counter()
+        log_timing(
+            stage,
+            request_id,
+            ended - started,
+            started_monotonic_s=started,
+            ended_monotonic_s=ended,
+            **fields,
+        )
+
+
+async def encoder_post(target_url: str, encoder_req: dict, headers: dict, parent_request_id: str, transfer_id: str):
+    # This ends at response headers; body draining remains in the fan-out loop.
+    with profile_stage(
+        "encoder_http_headers",
+        headers["x-request-id"],
+        parent_request_id=parent_request_id,
+        transfer_id=transfer_id,
+        target_url=target_url,
+    ) as timing:
+        response = await encode_session.post(
+            f"{target_url}/v1/chat/completions",
+            json=encoder_req,
+            headers=headers,
+        )
+        timing["http_status"] = response.status
+        if response.status != 200:
+            timing["status"] = "error"
+        return response
 
 
 def content_uuid(item: dict) -> str:
@@ -218,13 +275,7 @@ async def fanout_encoder_primer(
                 "consumer_zmq": consumer_zmq,
                 "ec_items": [{"mm_hash": item_uuid, "transfer_id": transfer_id}],
             }
-        tasks.append(
-            encode_session.post(
-                f"{target_url}/v1/chat/completions",
-                json=encoder_req,
-                headers=headers,
-            )
-        )
+        tasks.append(encoder_post(target_url, encoder_req, headers, req_id, transfer_id))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -435,11 +486,14 @@ async def prepare_for_decode(
 ) -> tuple[dict, float, float]:
     """Encode, attach EC identities and prefill without mutating the request."""
     _t0 = time.perf_counter()
-    item_meta = await fanout_encoder_primer(req_data, e_urls, req_id, consumer_zmq)
+    with profile_stage("encode", req_id, encoder_urls=e_urls):
+        item_meta = await fanout_encoder_primer(req_data, e_urls, req_id, consumer_zmq)
     _t1 = time.perf_counter()
-    prepared = req_data if NO_REWRITE else rewrite_for_decode(req_data, item_meta)
+    with profile_stage("rewrite", req_id):
+        prepared = req_data if NO_REWRITE else rewrite_for_decode(req_data, item_meta)
     _t2 = time.perf_counter()
-    prepared = await maybe_prefill(prepared, p_url, req_id)
+    with profile_stage("prefill_http", req_id, target_url=p_url):
+        prepared = await maybe_prefill(prepared, p_url, req_id)
     return prepared, _t1 - _t0, _t2 - _t1
 
 
@@ -452,58 +506,66 @@ async def forward_non_stream(
     consumer_zmq: str | None,
     dp_rank: int | None = None,
 ) -> dict:
-    try:
-        for attempt in range(DECODE_RETRIES + 1):
-            _t0 = time.perf_counter()
-            prepared, encode_s, rewrite_s = await prepare_for_decode(req_data, req_id, e_urls, p_url, consumer_zmq)
-            _t2 = time.perf_counter()
-
-            logger.info("[%s] Forwarding to decode: %s", req_id, d_url)
-            headers = {"x-request-id": req_id}
-            if dp_rank is not None:
-                headers["X-data-parallel-rank"] = str(dp_rank)
-
-            async with decode_session.post(f"{d_url}/v1/chat/completions", json=prepared, headers=headers) as resp:
-                if resp.status >= 400:
-                    detail = await resp.text()
-                    # 500 is the decoder's retryable internal error, which
-                    # includes an encoder embedding it could not obtain. Redoing
-                    # the encode publishes the item again.
-                    if resp.status == 500 and attempt < DECODE_RETRIES:
-                        logger.warning(
-                            "[%s] Decode returned 500, re-encoding and retrying (attempt %d/%d): %s",
-                            req_id,
-                            attempt + 1,
-                            DECODE_RETRIES,
-                            detail[:200],
-                        )
-                        continue
-                    logger.error(
-                        "[%s] Decode request returned status %s: %s",
-                        req_id,
-                        resp.status,
-                        detail,
+    with profile_stage("request", req_id, decode_url=d_url, encoder_urls=e_urls):
+        try:
+            for attempt in range(DECODE_RETRIES + 1):
+                with profile_stage("attempt", req_id, decode_url=d_url, attempt=attempt) as attempt_timing:
+                    _t0 = time.perf_counter()
+                    prepared, encode_s, rewrite_s = await prepare_for_decode(
+                        req_data, req_id, e_urls, p_url, consumer_zmq
                     )
-                    raise HTTPException(status_code=resp.status, detail=detail)
-                out = await resp.json()
-                _t3 = time.perf_counter()
-                logger.info(
-                    "STAGE %s encode=%.1f rewrite=%.1f decode=%.1f total=%.1f attempt=%d",
-                    "no-rewrite" if NO_REWRITE else "rewrite",
-                    encode_s * 1e3,
-                    rewrite_s * 1e3,
-                    (_t3 - _t2) * 1e3,
-                    (_t3 - _t0) * 1e3,
-                    attempt,
-                )
-                return out
-        raise HTTPException(status_code=500, detail="Decode failed after re-encoding")
+                    _t2 = time.perf_counter()
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("[%s] Error in forward_non_stream: %s", req_id, str(e))
-        raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}") from e
+                    logger.info("[%s] Forwarding to decode: %s", req_id, d_url)
+                    headers = {"x-request-id": req_id}
+                    if dp_rank is not None:
+                        headers["X-data-parallel-rank"] = str(dp_rank)
+
+                    with profile_stage("pd_http", req_id, decode_url=d_url, attempt=attempt) as timing:
+                        async with decode_session.post(
+                            f"{d_url}/v1/chat/completions", json=prepared, headers=headers
+                        ) as resp:
+                            if resp.status >= 400:
+                                detail = await resp.text()
+                                # 500 is the decoder's retryable internal error, which
+                                # includes an encoder embedding it could not obtain. Redoing
+                                # the encode publishes the item again.
+                                if resp.status == 500 and attempt < DECODE_RETRIES:
+                                    logger.warning(
+                                        "[%s] Decode returned 500, re-encoding and retrying (attempt %d/%d): %s",
+                                        req_id,
+                                        attempt + 1,
+                                        DECODE_RETRIES,
+                                        detail[:200],
+                                    )
+                                    timing["status"] = attempt_timing["status"] = "retry"
+                                    continue
+                                logger.error(
+                                    "[%s] Decode request returned status %s: %s",
+                                    req_id,
+                                    resp.status,
+                                    detail,
+                                )
+                                raise HTTPException(status_code=resp.status, detail=detail)
+                            out = await resp.json()
+                            _t3 = time.perf_counter()
+                            logger.info(
+                                "STAGE %s encode=%.1f rewrite=%.1f decode=%.1f total=%.1f attempt=%d",
+                                "no-rewrite" if NO_REWRITE else "rewrite",
+                                encode_s * 1e3,
+                                rewrite_s * 1e3,
+                                (_t3 - _t2) * 1e3,
+                                (_t3 - _t0) * 1e3,
+                                attempt,
+                            )
+                            return out
+            raise HTTPException(status_code=500, detail="Decode failed after re-encoding")
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("[%s] Error in forward_non_stream: %s", req_id, str(e))
+            raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}") from e
 
 
 async def forward_stream(
@@ -515,61 +577,71 @@ async def forward_stream(
     consumer_zmq: str | None,
     dp_rank: int | None = None,
 ) -> AsyncIterator[str]:
-    try:
-        for attempt in range(DECODE_RETRIES + 1):
-            _t0 = time.perf_counter()
-            prepared, encode_s, rewrite_s = await prepare_for_decode(req_data, req_id, e_urls, p_url, consumer_zmq)
-            _t2 = time.perf_counter()
-
-            logger.info("[%s] Starting streaming from decode: %s", req_id, d_url)
-            headers = {"x-request-id": req_id}
-            if dp_rank is not None:
-                headers["X-data-parallel-rank"] = str(dp_rank)
-
-            _first = None
-            async with decode_session.post(
-                f"{d_url}/v1/chat/completions",
-                json=prepared,
-                headers=headers,
-            ) as resp:
-                # Retry only before the first chunk: once anything reached the
-                # client the response cannot be replaced.
-                if resp.status == 500 and attempt < DECODE_RETRIES:
-                    detail = await resp.text()
-                    logger.warning(
-                        "[%s] Decode returned 500 before streaming, re-encoding and retrying (attempt %d/%d): %s",
-                        req_id,
-                        attempt + 1,
-                        DECODE_RETRIES,
-                        detail[:200],
+    with profile_stage("request", req_id, decode_url=d_url, encoder_urls=e_urls):
+        try:
+            for attempt in range(DECODE_RETRIES + 1):
+                with profile_stage("attempt", req_id, decode_url=d_url, attempt=attempt) as attempt_timing:
+                    _t0 = time.perf_counter()
+                    prepared, encode_s, rewrite_s = await prepare_for_decode(
+                        req_data, req_id, e_urls, p_url, consumer_zmq
                     )
-                    continue
-                resp.raise_for_status()
-                async for chunk in resp.content.iter_chunked(1024):
-                    if chunk:
-                        if _first is None:
-                            _first = time.perf_counter()
-                        yield chunk.decode("utf-8", errors="ignore")
-            _t3 = time.perf_counter()
+                    _t2 = time.perf_counter()
 
-            logger.info(
-                "STAGE %s encode=%.1f rewrite=%.2f decode_ttfb=%.1f decode_total=%.1f attempt=%d",
-                "no-rewrite" if NO_REWRITE else "rewrite",
-                encode_s * 1e3,
-                rewrite_s * 1e3,
-                ((_first or _t3) - _t2) * 1e3,
-                (_t3 - _t2) * 1e3,
-                attempt,
-            )
-            logger.info("[%s] Streaming completed", req_id)
-            return
+                    logger.info("[%s] Starting streaming from decode: %s", req_id, d_url)
+                    headers = {"x-request-id": req_id}
+                    if dp_rank is not None:
+                        headers["X-data-parallel-rank"] = str(dp_rank)
 
-    except HTTPException:
-        logger.exception("[%s] HTTPException in forward_stream", req_id)
-        raise
-    except Exception as e:
-        logger.exception("[%s] Error in forward_stream: %s", req_id, str(e))
-        raise HTTPException(status_code=500, detail=f"Proxy streaming error: {str(e)}") from e
+                    _first = None
+                    with profile_stage("pd_http", req_id, decode_url=d_url, attempt=attempt) as timing:
+                        async with decode_session.post(
+                            f"{d_url}/v1/chat/completions",
+                            json=prepared,
+                            headers=headers,
+                        ) as resp:
+                            # Retry only before the first chunk: once anything reached the
+                            # client the response cannot be replaced.
+                            if resp.status == 500 and attempt < DECODE_RETRIES:
+                                detail = await resp.text()
+                                logger.warning(
+                                    "[%s] Decode returned 500 before streaming, re-encoding and retrying "
+                                    "(attempt %d/%d): %s",
+                                    req_id,
+                                    attempt + 1,
+                                    DECODE_RETRIES,
+                                    detail[:200],
+                                )
+                                timing["status"] = attempt_timing["status"] = "retry"
+                                continue
+                            resp.raise_for_status()
+                            async for chunk in resp.content.iter_chunked(1024):
+                                if chunk:
+                                    if _first is None:
+                                        _first = time.perf_counter()
+                                        log_timing(
+                                            "pd_first_byte", req_id, _first - _t2, decode_url=d_url, attempt=attempt
+                                        )
+                                    yield chunk.decode("utf-8", errors="ignore")
+                        _t3 = time.perf_counter()
+
+                        logger.info(
+                            "STAGE %s encode=%.1f rewrite=%.2f decode_ttfb=%.1f decode_total=%.1f attempt=%d",
+                            "no-rewrite" if NO_REWRITE else "rewrite",
+                            encode_s * 1e3,
+                            rewrite_s * 1e3,
+                            ((_first or _t3) - _t2) * 1e3,
+                            (_t3 - _t2) * 1e3,
+                            attempt,
+                        )
+                        logger.info("[%s] Streaming completed", req_id)
+                        return
+
+        except HTTPException:
+            logger.exception("[%s] HTTPException in forward_stream", req_id)
+            raise
+        except Exception as e:
+            logger.exception("[%s] Error in forward_stream: %s", req_id, str(e))
+            raise HTTPException(status_code=500, detail=f"Proxy streaming error: {str(e)}") from e
 
 
 ###############################################################################

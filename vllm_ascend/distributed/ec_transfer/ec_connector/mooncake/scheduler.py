@@ -9,6 +9,7 @@ request availability without owning tensor memory or running data transfers.
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from collections import Counter
@@ -134,6 +135,7 @@ class ECMooncakeScheduler:
 
         self._metadata_fields_cache: dict[str, set[str]] = {}
         self._consumer_metrics_started_at = time.monotonic()
+        self._timing_enabled = config.timing_enabled
         self._consumer_scheduler_metrics: Counter[str] = Counter()
         self._drain_pending = True
         self._drained_at = 0.0
@@ -142,6 +144,22 @@ class ECMooncakeScheduler:
         self._scheduler_pending_work = False
         self._pushes_to_prepare: dict[str, ECMooncakePushSpec] = {}
         self._prepared_push_transfer_ids: set[str] = set()
+
+    def _log_timing(self, stage: str, duration_s: float, **fields: Any) -> None:
+        if not self._timing_enabled:
+            return
+        logger.info(
+            "NPU_EPD_TIMING %s",
+            json.dumps(
+                {
+                    "component": "connector",
+                    "stage": stage,
+                    "duration_s": duration_s,
+                    **{key: value for key, value in fields.items() if value not in (None, "")},
+                },
+                separators=(",", ":"),
+            ),
+        )
 
     def _cancel_remote(self, consumer_zmq: str, transfer_id: str, reservation_id: str) -> bool:
         error: Exception | None = None
@@ -246,7 +264,11 @@ class ECMooncakeScheduler:
         transfer_id = str(data["transfer_id"])
         identifier = str(data["mm_hash"])
         reservation_id = str(data["reservation_id"])
-        _, accepted = self._transfers.observe_ready(
+        waiting = self._transfers.get(transfer_id) if self._timing_enabled else None
+        waiting_started_at = (
+            waiting.deadline - self._push_wait_timeout if waiting is not None and waiting.deadline is not None else None
+        )
+        record, accepted = self._transfers.observe_ready(
             ECMooncakeLoadSpec(
                 mm_hash=identifier,
                 num_token=0,
@@ -259,6 +281,16 @@ class ECMooncakeScheduler:
             ),
             time.monotonic() + _LEASE_TTL_SECONDS,
         )
+        if accepted and waiting_started_at is not None:
+            self._log_timing(
+                "consumer_wait_ready",
+                max(0.0, time.monotonic() - waiting_started_at),
+                request_id=record.request_id,
+                transfer_id=transfer_id,
+                mm_hash=identifier,
+                boundary="scheduler_wait_to_ready_event",
+                status="ok",
+            )
         return accepted
 
     def _queue_cancel(

@@ -6,7 +6,7 @@ import importlib.util
 import json
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 _PROXY_PATH = Path(__file__).resolve().parents[4] / "examples/disaggregated_encoder/disagg_epd_proxy.py"
 _spec = importlib.util.spec_from_file_location("npu_ec_proxy", _PROXY_PATH)
@@ -74,6 +74,95 @@ class ProxyIdentityTest(unittest.IsolatedAsyncioTestCase):
     def test_text_only_is_unchanged(self):
         request = {"messages": [{"role": "user", "content": "hello"}]}
         self.assertIs(proxy.rewrite_for_decode(request, {}), request)
+
+
+class ProxyTimingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_retry_and_failure_records(self):
+        for statuses in ((500, 200), (400,)):
+            with self.subTest(statuses=statuses):
+                session = MagicMock()
+                contexts = []
+                for status in statuses:
+                    response = AsyncMock()
+                    response.status = status
+                    response.text.return_value = "failed"
+                    response.json.return_value = {"answer": "ok"}
+                    context = AsyncMock()
+                    context.__aenter__.return_value = response
+                    contexts.append(context)
+                session.post.side_effect = contexts
+                with (
+                    patch.object(proxy, "PROFILE_ENABLED", True),
+                    patch.object(proxy, "decode_session", session),
+                    patch.object(proxy.logger, "info") as log,
+                ):
+                    call = proxy.forward_non_stream(
+                        {"messages": []}, "parent", ["http://encoder"], None, "http://pd", None
+                    )
+                    if statuses == (400,):
+                        with self.assertRaises(proxy.HTTPException):
+                            await call
+                    else:
+                        self.assertEqual(await call, {"answer": "ok"})
+                records = [json.loads(c.args[1]) for c in log.call_args_list if c.args[0] == "NPU_EPD_TIMING %s"]
+                attempts = [r for r in records if r["stage"] == "attempt"]
+                self.assertEqual([r["status"] for r in attempts], ["retry", "ok"] if len(statuses) == 2 else ["error"])
+                self.assertEqual([r["attempt"] for r in attempts], list(range(len(statuses))))
+                self.assertEqual(len([r for r in records if r["stage"] == "pd_http"]), len(statuses))
+                self.assertEqual(records[-1]["stage"], "request")
+                for record in records:
+                    self.assertEqual(record["component"], "proxy")
+                    self.assertEqual(record["request_id"], "parent")
+                    self.assertGreaterEqual(record["duration_s"], 0)
+                    self.assertAlmostEqual(
+                        record["duration_s"], record["ended_monotonic_s"] - record["started_monotonic_s"]
+                    )
+
+    async def test_stream_first_byte_and_disabled_logging(self):
+        async def chunks():
+            yield b""
+            yield b"data: role\n\n"
+            yield b"data: [DONE]\n\n"
+
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                response = MagicMock()
+                response.status = 200
+                response.content.iter_chunked.return_value = chunks()
+                session = MagicMock()
+                session.post.return_value.__aenter__ = AsyncMock(return_value=response)
+                session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+                with (
+                    patch.object(proxy, "PROFILE_ENABLED", enabled),
+                    patch.object(proxy, "decode_session", session),
+                    patch.object(proxy.logger, "info") as log,
+                ):
+                    result = [chunk async for chunk in proxy.forward_stream({}, "parent", [], None, "http://pd", None)]
+                self.assertEqual(result, ["data: role\n\n", "data: [DONE]\n\n"])
+                records = [json.loads(c.args[1]) for c in log.call_args_list if c.args[0] == "NPU_EPD_TIMING %s"]
+                if enabled:
+                    first = [r for r in records if r["stage"] == "pd_first_byte"]
+                    self.assertEqual(len(first), 1)
+                    self.assertEqual(first[0]["attempt"], 0)
+                    self.assertEqual(records[-1]["status"], "ok")
+                else:
+                    self.assertEqual(records, [])
+
+    async def test_encoder_child_correlation(self):
+        session = AsyncMock()
+        session.post.return_value.status = 200
+        with (
+            patch.object(proxy, "PROFILE_ENABLED", True),
+            patch.object(proxy, "encode_session", session),
+            patch.object(proxy.logger, "info") as log,
+        ):
+            await proxy.encoder_post("http://encoder", {}, {"x-request-id": "child"}, "parent", "transfer")
+        record = json.loads(log.call_args.args[1])
+        self.assertEqual(record["stage"], "encoder_http_headers")
+        self.assertEqual(record["request_id"], "child")
+        self.assertEqual(record["parent_request_id"], "parent")
+        self.assertEqual(record["transfer_id"], "transfer")
+        self.assertEqual(record["target_url"], "http://encoder")
 
 
 if __name__ == "__main__":

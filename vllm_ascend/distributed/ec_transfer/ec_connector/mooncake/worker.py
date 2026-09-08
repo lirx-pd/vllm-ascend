@@ -549,15 +549,14 @@ class ECMooncakeWorker:
         for reservation in reservations:
             if reservation.get("cancelled", False):
                 continue
-            result = self._control_client.request(
-                str(reservation.get("addr", spec.consumer_zmq)),
-                make_cancel_request(
-                    spec.transfer_id,
-                    str(reservation.get("reservation_id", "")),
-                    abandon=True,
-                    refresh=refresh,
-                ),
+            request = make_cancel_request(
+                spec.transfer_id,
+                str(reservation.get("reservation_id", "")),
+                abandon=True,
+                refresh=refresh,
             )
+            request["mm_hash"] = spec.mm_hash
+            result = self._control_client.request(str(reservation.get("addr", spec.consumer_zmq)), request)
             if not isinstance(result, dict) or not result.get("cancelled"):
                 raise RuntimeError(f"Could not cancel EC reservation for mm_hash={spec.mm_hash}")
 
@@ -578,7 +577,16 @@ class ECMooncakeWorker:
         raise error
 
     def _reserve_remote(self, spec: ECMooncakePushSpec) -> list[dict[str, Any]]:
-        return [self._reserve_one(spec.consumer_zmq, spec)]
+        try:
+            return [self._reserve_one(spec.consumer_zmq, spec)]
+        except Exception:
+            # No writer has started. Cancel even an unacknowledged reservation
+            # and notify the consumer instead of leaving it to time out.
+            try:
+                self._retry_cancel_reservations(spec, [{"addr": spec.consumer_zmq, "reservation_id": ""}])
+            except Exception:
+                logger.exception("Failed to cancel rejected EC reservation for transfer_id=%s", spec.transfer_id)
+            raise
 
     def _refresh_remote_reservations(
         self,

@@ -71,6 +71,7 @@ class ReservationActionRequest(ReservationItem):
     op: Literal["complete", "cancel"]
     abandon: NotRequired[bool]
     refresh: NotRequired[bool]
+    mm_hash: NotRequired[str]
 
 
 ControlRequest = EventPortRequest | StatusRequest | ReserveRequest | ReservationActionRequest | CompleteBatchRequest
@@ -393,6 +394,20 @@ class ConsumerControlServer:
                                     bool(request.get("refresh", False)),
                                 )
                             }
+                            if (
+                                result["cancelled"]
+                                and request.get("abandon")
+                                and not request.get("refresh")
+                                and request.get("mm_hash")
+                            ):
+                                queue_event(
+                                    {
+                                        "transfer_id": str(request["transfer_id"]),
+                                        "mm_hash": str(request["mm_hash"]),
+                                        "failed": True,
+                                        "error": "producer abandoned transfer",
+                                    }
+                                )
                         else:
                             raise ValueError(f"unknown control op: {op!r}")
                         socket.send_json({"ok": True, "result": result})

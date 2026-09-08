@@ -75,6 +75,7 @@ _ALLOWED_TRANSITIONS = {
         SchedulerTransferState.LOADING,
         SchedulerTransferState.EXPIRED,
         SchedulerTransferState.CANCELLED,
+        SchedulerTransferState.UNAVAILABLE,
     },
     SchedulerTransferState.LOADING: {
         SchedulerTransferState.READY,

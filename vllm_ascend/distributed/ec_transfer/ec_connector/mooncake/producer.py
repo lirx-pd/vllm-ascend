@@ -188,7 +188,13 @@ class ProducerPushManager:
             grouped: dict[str, list[ProducerPushRecord]] = {}
             for transfer_id in list(self._active_ids):
                 record = self._records[transfer_id]
-                if record.source is not None and record.batch_future is None and record.state in _SOURCE_WAIT_STATES:
+                if (
+                    record.source is not None
+                    and record.batch_future is None
+                    and record.state in _SOURCE_WAIT_STATES
+                    and record.reservation_future.done()
+                    and record.reservation_future.exception() is None
+                ):
                     grouped.setdefault(record.spec.consumer_zmq, []).append(record)
             batches = list(grouped.values())
             for records in batches:
@@ -216,8 +222,9 @@ class ProducerPushManager:
         except Exception as exc:
             with self._lock:
                 self._set_error(record, exc)
-                if record.state is ProducerPushState.RESERVING and record.source is None:
+                if record.state in _SOURCE_WAIT_STATES:
                     self._transition(record, ProducerPushState.FAILED)
+                    self._release_source(record)
             return
         with self._lock:
             if record.state is ProducerPushState.RESERVING:

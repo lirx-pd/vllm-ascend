@@ -6,10 +6,13 @@ from __future__ import annotations
 import ast
 import importlib.util
 import logging
+import socket
 import sys
+import time
 import types
 import unittest
 from collections import Counter
+from concurrent.futures import Future
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -129,6 +132,7 @@ class TestMooncakeNPUDataPlane(unittest.TestCase):
             "vllm_ascend.distributed.ec_transfer.ec_connector.mooncake.control",
             "vllm_ascend.distributed.ec_transfer.ec_connector.mooncake._availability",
             "vllm_ascend.distributed.ec_transfer.ec_connector.mooncake.scheduler",
+            "vllm_ascend.distributed.ec_transfer.ec_connector.mooncake.producer",
             "torch",
         )
         cls.original_modules = {name: sys.modules.get(name) for name in cls.module_names}
@@ -178,6 +182,8 @@ class TestMooncakeNPUDataPlane(unittest.TestCase):
         control.EventInbox = object
         control.make_cancel_request = lambda *args: args
         cls.scheduler_module = _load(f"{prefix}.scheduler", "scheduler.py")
+        cls.producer_module = _load(f"{prefix}.producer", "producer.py")
+        cls.control_module = _load(f"{prefix}.control", "control.py")
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -267,6 +273,85 @@ class TestMooncakeNPUDataPlane(unittest.TestCase):
             transfer_id=transfer_id,
             reservation_id=f"reservation-{transfer_id}",
         )
+
+    def test_failed_reservation_with_bound_source_does_not_poison_batch(self):
+        manager = self.producer_module.ProducerPushManager()
+        records = {}
+        futures = {}
+        for identity in ("failed", "healthy", "pending"):
+            future = Future()
+            spec = self.metadata_module.ECMooncakePushSpec(identity, 4, (1,), "float32", "consumer", identity, identity)
+            records[identity], _ = manager.reserve(spec, lambda future=future: future)
+            futures[identity] = future
+            manager.bind_source(identity, object(), None)
+        futures["failed"].set_exception(RuntimeError("EC consumer buffer pool is full"))
+        futures["healthy"].set_result([{"reservation_id": "healthy"}])
+        executor = MagicMock()
+        executor.submit.return_value = Future()
+        run_batch = MagicMock()
+        manager.submit_batches(executor, run_batch, MagicMock())
+
+        executor.submit.assert_called_once_with(run_batch, [records["healthy"]])
+        self.assertIs(records["failed"].state, self.producer_module.ProducerPushState.FAILED)
+        self.assertIsNone(records["failed"].source)
+        self.assertIsNone(records["pending"].batch_future)
+        self.assertEqual(manager.poll(), [("failed", "EC consumer buffer pool is full")])
+
+    def test_failed_event_notifies_current_or_future_request_without_timeout(self):
+        for initial_state in ("before_request", "waiting", "available"):
+            with self.subTest(initial_state=initial_state):
+                scheduler = self._consumer_scheduler()
+                scheduler._drain_pending = True
+                scheduler._drained_at = 0.0
+                scheduler._poll_pending_cancels = MagicMock()
+                scheduler._expire_transfers = MagicMock()
+                scheduler._reservation_zmq_addr = "consumer"
+                scheduler._event_inbox = MagicMock()
+                scheduler._event_inbox.drain.return_value = [
+                    {"transfer_id": "failed", "mm_hash": "image", "failed": True, "error": "abandoned"}
+                ]
+                if initial_state == "available":
+                    scheduler._transfers.observe_ready(self._push_spec("failed"), 60.0)
+                if initial_state != "before_request":
+                    scheduler._transfers.wait_for_event("failed", "request", "image", 60.0)
+                self.scheduler_module.ECMooncakeScheduler._drain_push_notifications(scheduler)
+                scheduler._transfers.wait_for_event("failed", "request", "image", 60.0)
+                self.assertEqual(scheduler.take_unavailable_requests(), {"request"})
+                self.assertIs(
+                    scheduler._transfers.get("failed").state, self.state_module.SchedulerTransferState.UNAVAILABLE
+                )
+
+    def test_abandon_emits_failure_but_reservation_refresh_does_not(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        control = self.control_module
+        server = control.ConsumerControlServer(
+            "127.0.0.1", port, MagicMock(), MagicMock(), MagicMock(), MagicMock(return_value=True), lambda: 0, 0
+        )
+        client = control.ControlClient(1000)
+        inbox = control.EventInbox(client)
+        addr = f"tcp://127.0.0.1:{port}"
+        try:
+            server.start()
+            inbox._connect(addr)
+            for transfer_id, refresh in (("refresh", True), ("failed", False)):
+                payload = control.make_cancel_request(transfer_id, "", abandon=True, refresh=refresh)
+                payload["mm_hash"] = "image"
+                self.assertTrue(client.request(addr, payload)["cancelled"])
+            events = []
+            deadline = time.monotonic() + 2
+            while not events and time.monotonic() < deadline:
+                events.extend(inbox.drain(addr))
+                time.sleep(0.01)
+            self.assertEqual(
+                events,
+                [{"transfer_id": "failed", "mm_hash": "image", "failed": True, "error": "producer abandoned transfer"}],
+            )
+        finally:
+            inbox.close()
+            client.close()
+            server.close()
 
     @staticmethod
     def _request(transfer_id):

@@ -520,6 +520,21 @@ class ConsumerMemoryPool:
             if released is not None:
                 self._defer_or_free(released, self._record_release_event())
 
+    def complete_write(self, mm_hash: str, allocation: MemoryAllocation) -> ResidentLease[MemoryAllocation]:
+        """Share a completed destination while each reservation retains a lease."""
+        with self.lock:
+            lease = self.acquire_cached(mm_hash, tuple(allocation.tensor.shape), allocation.tensor.dtype)
+            if lease is not None:
+                # Completion guarantees the remote writer has stopped. This
+                # duplicate destination was never exposed to the model stream.
+                self._free(allocation)
+                return lease
+            self._residents.insert(mm_hash, allocation, allocation.size)
+            self._residents.retire(mm_hash)
+            lease = self._residents.acquire(mm_hash)
+            assert lease is not None
+            return lease
+
     def publish(
         self,
         mm_hash: str,
@@ -548,7 +563,6 @@ class ConsumerMemoryPool:
     def retire_stale(
         self,
         encoder_cache: dict[str, torch.Tensor],
-        reserved_hashes: set[str],
     ) -> None:
         if self._pool is None:
             return
@@ -558,8 +572,6 @@ class ConsumerMemoryPool:
                 if allocation is None:
                     continue
                 if encoder_cache.get(mm_hash) is allocation.tensor:
-                    continue
-                if mm_hash in reserved_hashes:
                     continue
                 event = torch.npu.Event()
                 event.record(torch.npu.current_stream(self._pool.device))

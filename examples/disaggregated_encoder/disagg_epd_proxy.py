@@ -207,6 +207,18 @@ def extract_mm_items(request_data: dict) -> list[dict]:
     return items
 
 
+def decode_response_error(response: dict) -> str | None:
+    if response.get("error"):
+        return json.dumps(response["error"])
+    if any(choice.get("finish_reason") == "error" for choice in response.get("choices", [])):
+        return "Decode finished with an internal error"
+    return None
+
+
+def has_generated_output(message: dict) -> bool:
+    return any(message.get(field) for field in ("content", "reasoning", "reasoning_content", "tool_calls", "refusal"))
+
+
 async def fanout_encoder_primer(
     orig_request: dict,
     e_urls: list[str],
@@ -279,42 +291,47 @@ async def fanout_encoder_primer(
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Fail fast if any sub-request failed
-    for idx, r in enumerate(results):
-        if isinstance(r, Exception):
-            logger.error(
-                "[%s] Encoder request #%d raised exception: %s",
-                req_id,
-                idx,
-                r,
-                exc_info=r,
-            )
-            raise HTTPException(status_code=502, detail=f"Encoder request failed: {str(r)}")
-        if r.status != 200:
-            try:
-                detail = await r.text()
-            except Exception:
-                detail = "<unable to read body>"
-            logger.error(
-                "[%s] Encoder request #%d returned status %s: %s",
-                req_id,
-                idx,
-                r.status,
-                detail,
-            )
-            raise HTTPException(
-                status_code=r.status,
-                detail=f"Encoder request failed: {detail}",
-            )
+    try:
+        # Fail fast if any sub-request failed
+        for idx, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.error(
+                    "[%s] Encoder request #%d raised exception: %s",
+                    req_id,
+                    idx,
+                    r,
+                    exc_info=r,
+                )
+                raise HTTPException(status_code=502, detail=f"Encoder request failed: {str(r)}")
+            if r.status != 200:
+                try:
+                    detail = await r.text()
+                except Exception:
+                    detail = "<unable to read body>"
+                logger.error(
+                    "[%s] Encoder request #%d returned status %s: %s",
+                    req_id,
+                    idx,
+                    r.status,
+                    detail,
+                )
+                raise HTTPException(
+                    status_code=r.status,
+                    detail=f"Encoder request failed: {detail}",
+                )
 
-        # Drain the response before reusing the connection. The proxy already
-        # knows the identity sent to the encoder; grid metadata is not needed.
-        await r.read()
-        if idx in item_uuids:
-            item_meta[idx] = {
-                "mm_hash": item_uuids[idx],
-                "transfer_id": item_transfer_ids[idx],
-            }
+            # Drain the response before reusing the connection. The proxy already
+            # knows the identity sent to the encoder; grid metadata is not needed.
+            await r.read()
+            if idx in item_uuids:
+                item_meta[idx] = {
+                    "mm_hash": item_uuids[idx],
+                    "transfer_id": item_transfer_ids[idx],
+                }
+    finally:
+        for response in results:
+            if not isinstance(response, BaseException):
+                response.release()
 
     logger.info("[%s] All %d encoder requests completed successfully", req_id, len(mm_items))
     return item_meta
@@ -453,7 +470,8 @@ async def log_requests(request: Request, call_next):
 async def on_startup() -> None:
     global encode_session, prefill_session, decode_session
     timeout = aiohttp.ClientTimeout(total=100_000)
-    connector = aiohttp.TCPConnector(limit=0, force_close=False)
+    # Avoid reusing idle connections that the upstream server has already closed.
+    connector = aiohttp.TCPConnector(limit=0, force_close=True)
     encode_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
     if app.state.p_urls:
         # only setup if prefill instance(s) exist
@@ -548,6 +566,15 @@ async def forward_non_stream(
                                 )
                                 raise HTTPException(status_code=resp.status, detail=detail)
                             out = await resp.json()
+                            error = decode_response_error(out)
+                            if error is None and not out.get("choices"):
+                                error = "Decode returned no choices"
+                            if error is not None:
+                                if attempt < DECODE_RETRIES:
+                                    timing["status"] = attempt_timing["status"] = "retry"
+                                    logger.warning("[%s] Re-encoding after decode error: %s", req_id, error)
+                                    continue
+                                raise HTTPException(status_code=502, detail=error)
                             _t3 = time.perf_counter()
                             logger.info(
                                 "STAGE %s encode=%.1f rewrite=%.1f decode=%.1f total=%.1f attempt=%d",
@@ -577,71 +604,115 @@ async def forward_stream(
     consumer_zmq: str | None,
     dp_rank: int | None = None,
 ) -> AsyncIterator[str]:
-    with profile_stage("request", req_id, decode_url=d_url, encoder_urls=e_urls):
+    with profile_stage("request", req_id, decode_url=d_url, encoder_urls=e_urls) as request_timing:
+        emitted_output = False
         try:
             for attempt in range(DECODE_RETRIES + 1):
                 with profile_stage("attempt", req_id, decode_url=d_url, attempt=attempt) as attempt_timing:
-                    _t0 = time.perf_counter()
-                    prepared, encode_s, rewrite_s = await prepare_for_decode(
-                        req_data, req_id, e_urls, p_url, consumer_zmq
-                    )
-                    _t2 = time.perf_counter()
+                    try:
+                        prepared, encode_s, rewrite_s = await prepare_for_decode(
+                            req_data, req_id, e_urls, p_url, consumer_zmq
+                        )
+                        _t2 = time.perf_counter()
+                        headers = {"x-request-id": req_id}
+                        if dp_rank is not None:
+                            headers["X-data-parallel-rank"] = str(dp_rank)
 
-                    logger.info("[%s] Starting streaming from decode: %s", req_id, d_url)
-                    headers = {"x-request-id": req_id}
-                    if dp_rank is not None:
-                        headers["X-data-parallel-rank"] = str(dp_rank)
-
-                    _first = None
-                    with profile_stage("pd_http", req_id, decode_url=d_url, attempt=attempt) as timing:
-                        async with decode_session.post(
-                            f"{d_url}/v1/chat/completions",
-                            json=prepared,
-                            headers=headers,
-                        ) as resp:
-                            # Retry only before the first chunk: once anything reached the
-                            # client the response cannot be replaced.
-                            if resp.status == 500 and attempt < DECODE_RETRIES:
-                                detail = await resp.text()
-                                logger.warning(
-                                    "[%s] Decode returned 500 before streaming, re-encoding and retrying "
-                                    "(attempt %d/%d): %s",
-                                    req_id,
-                                    attempt + 1,
-                                    DECODE_RETRIES,
-                                    detail[:200],
-                                )
-                                timing["status"] = attempt_timing["status"] = "retry"
-                                continue
-                            resp.raise_for_status()
-                            async for chunk in resp.content.iter_chunked(1024):
-                                if chunk:
-                                    if _first is None:
-                                        _first = time.perf_counter()
+                        pending = []
+                        finished_choices = set()
+                        first_byte = None
+                        with profile_stage("pd_http", req_id, decode_url=d_url, attempt=attempt):
+                            async with decode_session.post(
+                                f"{d_url}/v1/chat/completions", json=prepared, headers=headers
+                            ) as resp:
+                                if resp.status >= 400:
+                                    raise HTTPException(status_code=resp.status, detail=await resp.text())
+                                # vLLM emits one JSON object per SSE data line. Reading
+                                # lines preserves UTF-8 across HTTP chunk boundaries.
+                                async for line in resp.content:
+                                    if not line.startswith(b"data:"):
+                                        continue
+                                    if first_byte is None:
+                                        first_byte = time.perf_counter()
                                         log_timing(
-                                            "pd_first_byte", req_id, _first - _t2, decode_url=d_url, attempt=attempt
+                                            "pd_first_byte", req_id, first_byte - _t2, decode_url=d_url, attempt=attempt
                                         )
-                                    yield chunk.decode("utf-8", errors="ignore")
+                                    data = line[5:].strip()
+                                    if data == b"[DONE]":
+                                        if not emitted_output:
+                                            # An EOS or excluded stop string can produce
+                                            # a valid completion with no visible text.
+                                            if finished_choices != set(range(req_data.get("n") or 1)):
+                                                raise HTTPException(
+                                                    status_code=502,
+                                                    detail="Decode ended without completing all choices",
+                                                )
+                                            emitted_output = True
+                                            for buffered in pending:
+                                                yield buffered
+                                        break
+                                    payload = json.loads(data)
+                                    error = decode_response_error(payload)
+                                    if error is not None:
+                                        raise HTTPException(status_code=502, detail=error)
+                                    finished_choices.update(
+                                        choice["index"]
+                                        for choice in payload.get("choices", [])
+                                        if choice.get("finish_reason") is not None
+                                    )
+                                    event = f"data: {data.decode('utf-8')}\n\n"
+                                    # Keep role-only chunks private so a failed transfer
+                                    # can be retried without duplicating client output.
+                                    if not emitted_output:
+                                        pending.append(event)
+                                        if not any(
+                                            has_generated_output(choice.get("delta") or {})
+                                            for choice in payload.get("choices", [])
+                                        ):
+                                            continue
+                                        emitted_output = True
+                                        for buffered in pending:
+                                            yield buffered
+                                        pending.clear()
+                                    else:
+                                        yield event
+                                else:
+                                    raise HTTPException(status_code=502, detail="Decode stream ended without [DONE]")
                         _t3 = time.perf_counter()
-
                         logger.info(
                             "STAGE %s encode=%.1f rewrite=%.2f decode_ttfb=%.1f decode_total=%.1f attempt=%d",
                             "no-rewrite" if NO_REWRITE else "rewrite",
                             encode_s * 1e3,
                             rewrite_s * 1e3,
-                            ((_first or _t3) - _t2) * 1e3,
+                            ((first_byte or _t3) - _t2) * 1e3,
                             (_t3 - _t2) * 1e3,
                             attempt,
                         )
                         logger.info("[%s] Streaming completed", req_id)
+                        yield "data: [DONE]\n\n"
                         return
-
-        except HTTPException:
-            logger.exception("[%s] HTTPException in forward_stream", req_id)
-            raise
-        except Exception as e:
-            logger.exception("[%s] Error in forward_stream: %s", req_id, str(e))
-            raise HTTPException(status_code=500, detail=f"Proxy streaming error: {str(e)}") from e
+                    except (
+                        HTTPException,
+                        aiohttp.ClientConnectionError,
+                        aiohttp.ClientPayloadError,
+                        TimeoutError,
+                    ) as exc:
+                        retryable = not isinstance(exc, HTTPException) or exc.status_code in (500, 502, 503, 504)
+                        if emitted_output or not retryable or attempt >= DECODE_RETRIES:
+                            raise
+                        attempt_timing["status"] = "retry"
+                        logger.warning("[%s] Re-encoding before streaming retry %d: %s", req_id, attempt + 1, exc)
+        except Exception as exc:
+            # StreamingResponse already sent HTTP headers. Report failure in-band
+            # instead of raising HTTPException and truncating the response body.
+            request_timing["status"] = "error"
+            request_timing["error_type"] = type(exc).__name__
+            logger.exception("[%s] Error in forward_stream: %s", req_id, exc)
+            status = exc.status_code if isinstance(exc, HTTPException) else 502
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            error = {"error": {"message": str(detail), "type": "ProxyError", "code": status}}
+            yield f"data: {json.dumps(error)}\n\n"
+            yield "data: [DONE]\n\n"
 
 
 ###############################################################################

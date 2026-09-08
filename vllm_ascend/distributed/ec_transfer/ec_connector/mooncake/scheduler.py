@@ -338,7 +338,13 @@ class ECMooncakeScheduler:
         for data in events:
             identifier = str(data["mm_hash"])
             self._consumer_scheduler_metrics["events_received"] += 1
-            if data.get("ready"):
+            if data.get("failed"):
+                transfer_id = str(data["transfer_id"])
+                record = self._transfers.wait_for_event(transfer_id, "", identifier, now + _LEASE_TTL_SECONDS)
+                if record.state in {SchedulerTransferState.WAITING_EVENT, SchedulerTransferState.AVAILABLE}:
+                    self._transfers.mark_unavailable(transfer_id, str(data["error"]), now)
+                    self._consumer_scheduler_metrics["events_failed"] += 1
+            elif data.get("ready"):
                 self._consumer_scheduler_metrics["events_ready"] += 1
                 transfer_id = str(data["transfer_id"])
                 record = self._transfers.get(transfer_id)

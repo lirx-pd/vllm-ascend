@@ -255,6 +255,9 @@ class ConsumerReservationManager:
                 return CompletionResult(True, discarded=True)
             if record.state is not ConsumerReservationState.WRITING:
                 return CompletionResult(False)
+            assert record.allocation is not None
+            record.lease = self._memory.complete_write(record.mm_hash, record.allocation)
+            record.allocation = record.lease.value
             self._transition(record, ConsumerReservationState.READY)
             record.expires_at = time.monotonic() + self._lease_ttl
             return CompletionResult(True, became_ready=True)
@@ -333,8 +336,7 @@ class ConsumerReservationManager:
 
     def retire_stale(self, encoder_cache: dict[str, torch.Tensor]) -> None:
         with self._memory.lock:
-            reserved_hashes = {record.mm_hash for record in self.active_records()}
-            self._memory.retire_stale(encoder_cache, reserved_hashes)
+            self._memory.retire_stale(encoder_cache)
 
     def _expire_locked(self, now: float) -> tuple[int, int, int]:
         expired = 0

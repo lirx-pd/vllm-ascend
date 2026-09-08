@@ -249,6 +249,7 @@ class AscendConfig:
 
         {
             "refresh": false,
+            "epd_profile": false,
             "enable_cpu_binding": true,
             "multistream_dsv4_dsa_overlap": true,
             "enable_prefill_mc2": false,
@@ -383,6 +384,7 @@ class AscendConfig:
     model_config = ConfigDict(extra="forbid")
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
+    epd_profile: bool = False
     enable_cpu_binding: bool = True
     multistream_dsv4_dsa_overlap: bool = True
     enable_prefill_mc2: bool = False

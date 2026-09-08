@@ -9,6 +9,7 @@ batched Mooncake writes, and report asynchronous completion to the Scheduler.
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
@@ -202,6 +203,7 @@ class ECMooncakeWorker:
             self._transfer,
         )
         self._transfer_metrics_log_interval = config.transfer_metrics_log_interval
+        self._timing_enabled = config.timing_enabled
         self._control_client = control_client
         self._producer_metrics: Counter[str] = Counter()
         self._io_executor = ThreadPoolExecutor(
@@ -226,6 +228,23 @@ class ECMooncakeWorker:
         self._completed_loads: set[str] = set()
         self._failed_loads: set[str] = set()
         self._shutdown = False
+
+    def _log_timing(self, stage: str, duration_s: float, **fields: Any) -> None:
+        if not self._timing_enabled:
+            return
+        logger.info(
+            "NPU_EPD_TIMING %s",
+            json.dumps(
+                {
+                    "component": "connector",
+                    "stage": stage,
+                    "duration_s": duration_s,
+                    "rank": self._device.index,
+                    **{key: value for key, value in fields.items() if value not in (None, "")},
+                },
+                separators=(",", ":"),
+            ),
+        )
 
     def start_services(self) -> None:
         if not self.is_consumer or self._reservation_zmq_port is None or self._control_server is not None:
@@ -435,21 +454,55 @@ class ECMooncakeWorker:
             return self._fanout_pool
 
     def _reserve_one(self, addr: str, spec: ECMooncakePushSpec) -> dict[str, Any]:
-        result = self._control_client.request(
-            addr,
-            {
-                "op": "reserve",
-                "transfer_id": spec.transfer_id,
-                "mm_hash": spec.mm_hash,
-                "nbytes": spec.nbytes,
-                "shape": list(spec.shape),
-                "dtype": spec.dtype,
-            },
-        )
+        started_at = time.monotonic() if self._timing_enabled else None
+        try:
+            result = self._control_client.request(
+                addr,
+                {
+                    "op": "reserve",
+                    "transfer_id": spec.transfer_id,
+                    "mm_hash": spec.mm_hash,
+                    "nbytes": spec.nbytes,
+                    "shape": list(spec.shape),
+                    "dtype": spec.dtype,
+                },
+            )
+        except Exception:
+            if started_at is not None:
+                self._log_timing(
+                    "producer_reservation_completed",
+                    time.monotonic() - started_at,
+                    request_id=spec.request_id,
+                    transfer_id=spec.transfer_id,
+                    mm_hash=spec.mm_hash,
+                    boundary="control_request_round_trip",
+                    status="error",
+                )
+            raise
         if not isinstance(result, dict):
+            if started_at is not None:
+                self._log_timing(
+                    "producer_reservation_completed",
+                    time.monotonic() - started_at,
+                    request_id=spec.request_id,
+                    transfer_id=spec.transfer_id,
+                    mm_hash=spec.mm_hash,
+                    boundary="control_request_round_trip",
+                    status="error",
+                )
             raise RuntimeError("Invalid EC reservation response")
         result["_received_at"] = time.monotonic()
         result["addr"] = addr
+        if started_at is not None:
+            self._log_timing(
+                "producer_reservation_completed",
+                time.monotonic() - started_at,
+                request_id=spec.request_id,
+                transfer_id=spec.transfer_id,
+                mm_hash=spec.mm_hash,
+                boundary="control_request_round_trip",
+                status="ok",
+            )
         return result
 
     def _run_fanout(
@@ -570,6 +623,7 @@ class ECMooncakeWorker:
         encoder_cache: dict[str, torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> None:
+        started_at = time.monotonic() if self._timing_enabled else None
         for spec in metadata.pushes:
             self._producer_pushes.reserve(
                 spec,
@@ -581,6 +635,16 @@ class ECMooncakeWorker:
             tensor = encoder_cache.get(mm_hash)
             if tensor is not None:
                 self._bind_push_source(tensor, mm_hash)
+        if started_at is not None and metadata.pushes:
+            self._log_timing(
+                "producer_save_enqueued",
+                time.monotonic() - started_at,
+                request_ids=[spec.request_id for spec in metadata.pushes if spec.request_id],
+                transfer_ids=[spec.transfer_id for spec in metadata.pushes],
+                mm_hashes=[spec.mm_hash for spec in metadata.pushes],
+                boundary="cpu_enqueue",
+                status="ok",
+            )
 
     def _submit_reservation(self, spec: ECMooncakePushSpec) -> Future[list[dict[str, Any]]]:
         return self._control_executor.submit(self._reserve_remote, spec)
@@ -597,11 +661,21 @@ class ECMooncakeWorker:
         self._reservations.retire_stale(encoder_cache)
 
         for spec in metadata.loads:
+            started_at = time.monotonic() if self._timing_enabled else None
             if spec.mm_hash in encoder_cache:
                 if spec.pushed:
                     # The spec's id is one shard's; cancel by transfer.
                     self._cancel_push(spec.transfer_id, "")
                 self._completed_loads.add(spec.mm_hash)
+                if started_at is not None:
+                    self._log_timing(
+                        "consumer_load_completed",
+                        time.monotonic() - started_at,
+                        transfer_id=spec.transfer_id,
+                        mm_hash=spec.mm_hash,
+                        boundary="worker_cache_handoff",
+                        status="cache_hit",
+                    )
                 continue
             if spec.local:
                 tensor = self._consumer_memory.take_resident(spec.mm_hash, tuple(spec.shape), spec.dtype)
@@ -622,6 +696,15 @@ class ECMooncakeWorker:
             else:
                 encoder_cache[spec.mm_hash] = tensor
                 self._completed_loads.add(spec.mm_hash)
+            if started_at is not None:
+                self._log_timing(
+                    "consumer_load_completed",
+                    time.monotonic() - started_at,
+                    transfer_id=spec.transfer_id,
+                    mm_hash=spec.mm_hash,
+                    boundary="worker_cache_handoff",
+                    status="ok" if tensor is not None else "error",
+                )
 
     def _push_batch(self, pushes: list[ProducerPushRecord]) -> None:
         started_at = time.monotonic()
@@ -634,6 +717,9 @@ class ECMooncakeWorker:
             assert push.source_at is not None
             queue_waits_ms.append(max(0, started_at - push.source_at) * 1000)
         stage_ms = {"queue": sum(queue_waits_ms), **dict.fromkeys(_PUSH_STAGES, 0.0)}
+        reservation_wait_ms = 0.0
+        if self._timing_enabled:
+            unique_source_count = len({id(push.source.tensor) for push in pushes if push.source is not None})
         ready: list[tuple[ProducerPushRecord, dict[str, Any]]] = []
         written_pushes: dict[str, ProducerPushRecord] = {}
         failed = False
@@ -642,7 +728,11 @@ class ECMooncakeWorker:
             for push in pushes:
                 self._validate_push_source(push)
                 stage_started_at = time.monotonic()
-                reservations = self._producer_pushes.resolve_reservations(push)
+                try:
+                    reservations = self._producer_pushes.resolve_reservations(push)
+                finally:
+                    if self._timing_enabled:
+                        reservation_wait_ms += (time.monotonic() - stage_started_at) * 1000
                 stale = [
                     index
                     for index, shard in enumerate(reservations)
@@ -664,8 +754,10 @@ class ECMooncakeWorker:
                 assert source is not None
                 if writable and source.ready_event is not None:
                     stage_started_at = time.monotonic()
-                    source.ready_event.synchronize()
-                    stage_ms["device"] += (time.monotonic() - stage_started_at) * 1000
+                    try:
+                        source.ready_event.synchronize()
+                    finally:
+                        stage_ms["device"] += (time.monotonic() - stage_started_at) * 1000
                 for shard in writable:
                     if int(shard["nbytes"]) != source.tensor.nbytes:
                         raise RuntimeError(f"Reserved EC size does not match tensor for mm_hash={push.spec.mm_hash}")
@@ -677,15 +769,17 @@ class ECMooncakeWorker:
                 tensors = [push.source.tensor for push in written_pushes.values() if push.source]
                 lengths = [tensor.nbytes for tensor in tensors]
                 stage_started_at = time.monotonic()
-                staged = self._producer_memory.stage(tensors)
-                if staged is None:
-                    raise RuntimeError("Mooncake EC producer NPU staging pool is full")
-                sources = staged.tensors
-                # Mooncake reads outside the NPU stream.
-                if sources:
-                    torch.npu.current_stream(sources[0].device).synchronize()
-                addresses = [tensor.data_ptr() for tensor in sources]
-                stage_ms["register"] = (time.monotonic() - stage_started_at) * 1000
+                try:
+                    staged = self._producer_memory.stage(tensors)
+                    if staged is None:
+                        raise RuntimeError("Mooncake EC producer NPU staging pool is full")
+                    sources = staged.tensors
+                    # Mooncake reads outside the NPU stream.
+                    if sources:
+                        torch.npu.current_stream(sources[0].device).synchronize()
+                    addresses = [tensor.data_ptr() for tensor in sources]
+                finally:
+                    stage_ms["register"] = (time.monotonic() - stage_started_at) * 1000
                 try:
                     by_session: dict[str, list[tuple[int, int]]] = {}
                     session_records: dict[str, dict[str, ProducerPushRecord]] = {}
@@ -713,8 +807,10 @@ class ECMooncakeWorker:
                         self._producer_pushes.track_io_futures(list(session_records[session].values()), [future])
 
                     writes: list[Callable[[], None]] = [partial(write, *session) for session in sessions]
-                    self._run_fanout(writes, track_write)
-                    stage_ms["transfer"] = (time.monotonic() - stage_started_at) * 1000
+                    try:
+                        self._run_fanout(writes, track_write)
+                    finally:
+                        stage_ms["transfer"] = (time.monotonic() - stage_started_at) * 1000
                 finally:
                     stage_started_at = time.monotonic()
                     self._producer_memory.release(staged)
@@ -722,8 +818,10 @@ class ECMooncakeWorker:
 
             self._producer_pushes.begin_notifying(pushes)
             stage_started_at = time.monotonic()
-            self._notify_completions(ready)
-            stage_ms["complete"] = (time.monotonic() - stage_started_at) * 1000
+            try:
+                self._notify_completions(ready)
+            finally:
+                stage_ms["complete"] = (time.monotonic() - stage_started_at) * 1000
             self._producer_pushes.complete(pushes)
         except Exception as exc:
             # Report asynchronously; raising here would fail EngineCore.
@@ -738,7 +836,66 @@ class ECMooncakeWorker:
         finally:
             if failure is not None:
                 self._producer_pushes.fail(pushes, failure)
-            stage_ms["total"] = (time.monotonic() - started_at) * 1000
+            ended_at = time.monotonic()
+            stage_ms["total"] = (ended_at - started_at) * 1000
+            if self._timing_enabled:
+                common = {
+                    "status": "ok" if not failed else "error",
+                    "batch_items": len(pushes),
+                    "batch_bytes": sum(push.spec.nbytes for push in pushes),
+                    "write_bytes": sum(int(shard["nbytes"]) for _, shard in ready),
+                    "unique_source_count": unique_source_count,
+                }
+                # Queue durations overlap across items; they are not a batch phase.
+                for push, queue_ms in zip(pushes, queue_waits_ms):
+                    self._log_timing(
+                        "producer_queue_completed",
+                        queue_ms / 1000,
+                        boundary="source_bound_to_batch_start",
+                        scope="item",
+                        started_monotonic_s=push.source_at,
+                        ended_monotonic_s=started_at,
+                        request_id=push.spec.request_id,
+                        transfer_id=push.spec.transfer_id,
+                        mm_hash=push.spec.mm_hash,
+                        **common,
+                    )
+                for stage, duration_ms, boundary in (
+                    ("producer_reservation_wait_completed", reservation_wait_ms, "batch_reservation_future_wait"),
+                    ("producer_device_ready_completed", stage_ms["device"], "batch_source_event_wait"),
+                    ("producer_staging_copy_completed", stage_ms["register"], "batch_staging_copy_and_stream_sync"),
+                    (
+                        "producer_staging_completed",
+                        stage_ms["device"] + stage_ms["register"],
+                        "batch_device_ready_and_staging",
+                    ),
+                    ("producer_transfer_completed", stage_ms["transfer"], "batch_mooncake_write"),
+                    ("producer_notification_completed", stage_ms["complete"], "batch_completion_notification"),
+                    ("producer_push_completed", stage_ms["total"], "batch_start_to_completion_notification"),
+                ):
+                    self._log_timing(
+                        stage,
+                        duration_ms / 1000,
+                        boundary=boundary,
+                        scope="batch",
+                        request_ids=[push.spec.request_id for push in pushes if push.spec.request_id],
+                        transfer_ids=[push.spec.transfer_id for push in pushes],
+                        mm_hashes=[push.spec.mm_hash for push in pushes],
+                        **(
+                            {"started_monotonic_s": started_at, "ended_monotonic_s": ended_at}
+                            if stage == "producer_push_completed"
+                            else {}
+                        ),
+                        aggregation="aggregate"
+                        if stage in ("producer_staging_completed", "producer_push_completed")
+                        else "phase",
+                        overlaps=(
+                            ["producer_device_ready_completed", "producer_staging_copy_completed"]
+                            if stage == "producer_staging_completed"
+                            else []
+                        ),
+                        **common,
+                    )
             self._record_push_perf(
                 stage_ms,
                 stage_max_ms={"queue": max(queue_waits_ms, default=0.0)},

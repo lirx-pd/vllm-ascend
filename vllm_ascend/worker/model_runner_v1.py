@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import json
 import logging
 import math
 import sys
@@ -671,6 +672,52 @@ class NPUModelRunner(GPUModelRunner):
         self.cpu_encoder_cache.clear()
         self.cached.clear()
         self._pending_encoder_cache_copies.clear()
+
+    def _execute_mm_encoder(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> list[torch.Tensor]:
+        scheduled_inputs = scheduler_output.scheduled_encoder_inputs
+        ec_config = self.vllm_config.ec_transfer_config
+        timing_enabled = self.ascend_config.epd_profile or (
+            ec_config is not None
+            and ec_config.ec_connector_extra_config.get("timing_enabled", False)
+        )
+        if not timing_enabled or not scheduled_inputs:
+            return super()._execute_mm_encoder(scheduler_output)
+
+        if ec_config is None:
+            role = "dp4"
+        elif ec_config.is_ec_producer:
+            role = "encoder"
+        else:
+            role = "pd"
+
+        started = time.monotonic()
+        status = "ok"
+        error = None
+        try:
+            return super()._execute_mm_encoder(scheduler_output)
+        except Exception as exc:
+            status = "error"
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            ended = time.monotonic()
+            event = {
+                "component": "encoder",
+                "stage": "execute_mm_encoder_host",
+                "scope": "batch",
+                "status": status,
+                "started_monotonic_s": started,
+                "ended_monotonic_s": ended,
+                "duration_s": ended - started,
+                "request_ids": list(scheduled_inputs),
+                "batch_items": sum(len(indices) for indices in scheduled_inputs.values()),
+                "role": role,
+            }
+            if error is not None:
+                event["error"] = error
+            logger.info("NPU_EPD_TIMING %s", json.dumps(event))
 
     @staticmethod
     def maybe_get_ec_connector_output(

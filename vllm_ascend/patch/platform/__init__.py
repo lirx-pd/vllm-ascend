@@ -39,6 +39,7 @@ if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXP
     import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
 
 import vllm_ascend.patch.platform.patch_encoder_cache_manager  # noqa
+import vllm_ascend.patch.platform.patch_ec_image_metadata  # noqa
 import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
 import vllm_ascend.patch.platform.patch_dyntra_lb_core  # noqa
 

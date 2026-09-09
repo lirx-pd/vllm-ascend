@@ -13,6 +13,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from typing import Any
 
 import torch
 
@@ -103,6 +104,7 @@ class ConsumerReservation:
     lease: ResidentLease[MemoryAllocation] | None = None
     created_at: float = field(default_factory=time.monotonic)
     expires_at: float = 0
+    writer_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -155,6 +157,9 @@ class ConsumerReservationManager:
         self._records: dict[str, ConsumerReservation] = {}
         self._active_ids: dict[str, None] = {}
         self._tombstones: OrderedDict[str, None] = OrderedDict()
+        self._writers: dict[str, ConsumerReservation] = {}
+        self._followers: dict[str, dict[str, None]] = {}
+        self._events: list[dict[str, Any]] = []
 
     def get(self, transfer_id: str) -> ConsumerReservation | None:
         return self._records.get(transfer_id)
@@ -206,6 +211,26 @@ class ConsumerReservationManager:
                 )
                 self._insert(record)
                 return record, False, False, (0, 0, 0)
+            writer = self._writers.get(mm_hash)
+            if writer is not None and writer.state is ConsumerReservationState.WRITING:
+                if writer.shape != shape or writer.dtype != dtype_name:
+                    raise ValueError("conflicting in-flight tensor for mm_hash")
+                record = ConsumerReservation(
+                    transfer_id,
+                    mm_hash,
+                    uuid.uuid4().hex,
+                    ConsumerReservationState.WRITING,
+                    shape,
+                    dtype_name,
+                    writer.allocation,
+                    None,
+                    now,
+                    now + self._lease_ttl,
+                    writer.transfer_id,
+                )
+                self._insert(record)
+                self._followers.setdefault(writer.transfer_id, {})[transfer_id] = None
+                return record, False, False, (0, 0, 0)
             expiry_counts = (0, 0, 0)
             allocation = self._memory.try_allocate(nbytes, shape, dtype)
             if allocation is None:
@@ -229,6 +254,7 @@ class ConsumerReservationManager:
             )
             self._transition(record, ConsumerReservationState.WRITING)
             self._insert(record)
+            self._writers[mm_hash] = record
             return record, True, False, expiry_counts
 
     def status(self, transfer_id: str) -> ConsumerReservation | None:
@@ -245,6 +271,8 @@ class ConsumerReservationManager:
                 return CompletionResult(False)
             if record.state is ConsumerReservationState.READY:
                 return CompletionResult(True, repeated=True)
+            if record.writer_id:
+                return CompletionResult(False)
             if record.state in _DEFERRED_STATES:
                 terminal = (
                     ConsumerReservationState.CANCELLED
@@ -255,12 +283,45 @@ class ConsumerReservationManager:
                 return CompletionResult(True, discarded=True)
             if record.state is not ConsumerReservationState.WRITING:
                 return CompletionResult(False)
-            assert record.allocation is not None
-            record.lease = self._memory.complete_write(record.mm_hash, record.allocation)
-            record.allocation = record.lease.value
+            self._publish_followers(record)
             self._transition(record, ConsumerReservationState.READY)
             record.expires_at = time.monotonic() + self._lease_ttl
             return CompletionResult(True, became_ready=True)
+
+    def _publish_followers(self, writer: ConsumerReservation) -> None:
+        if self._writers.get(writer.mm_hash) is writer:
+            self._writers.pop(writer.mm_hash)
+        assert writer.allocation is not None
+        writer.lease = self._memory.complete_write(writer.mm_hash, writer.allocation)
+        writer.allocation = writer.lease.value
+        for transfer_id in self._followers.pop(writer.transfer_id, {}):
+            record = self._records[transfer_id]
+            record.lease = self._memory.acquire_cached(record.mm_hash, record.shape, record.allocation.tensor.dtype)
+            assert record.lease is not None
+            record.allocation = record.lease.value
+            record.writer_id = ""
+            self._transition(record, ConsumerReservationState.READY)
+            record.expires_at = time.monotonic() + self._lease_ttl
+            self._events.append(self._wire_event(record))
+
+    def drain_events(self) -> list[dict[str, Any]]:
+        with self._memory.lock:
+            events, self._events = self._events, []
+            return events
+
+    @staticmethod
+    def _wire_event(record: ConsumerReservation) -> dict[str, Any]:
+        event: dict[str, Any] = {
+            "transfer_id": record.transfer_id,
+            "mm_hash": record.mm_hash,
+            "ready": record.state is ConsumerReservationState.READY,
+            "reservation_id": record.reservation_id,
+            "shape": list(record.shape),
+            "dtype": record.dtype,
+        }
+        if record.allocation is not None:
+            event["nbytes"] = record.allocation.tensor.nbytes
+        return event
 
     def cancel(
         self,
@@ -299,6 +360,10 @@ class ConsumerReservationManager:
                 if record.state is ConsumerReservationState.WRITING:
                     self._transition(record, ConsumerReservationState.EXPIRE_PENDING)
                 self._terminate(record, ConsumerReservationState.EXPIRED)
+                dropped = self._reap_tombstones(time.monotonic())
+                return CancellationOutcome.CANCELLED, dropped
+            if record.writer_id:
+                self._terminate(record, ConsumerReservationState.CANCELLED)
                 dropped = self._reap_tombstones(time.monotonic())
                 return CancellationOutcome.CANCELLED, dropped
             if record.state in _DEFERRED_STATES and not abandon:
@@ -349,8 +414,14 @@ class ConsumerReservationManager:
                 self._terminate(record, ConsumerReservationState.EXPIRED)
                 expired += 1
             elif record.state is ConsumerReservationState.WRITING:
-                self._transition(record, ConsumerReservationState.EXPIRE_PENDING)
-                deferred += 1
+                if record.writer_id:
+                    self._transition(record, ConsumerReservationState.EXPIRE_PENDING)
+                    self._terminate(record, ConsumerReservationState.EXPIRED)
+                    self._events.append(self._failed_event(record, "reservation expired"))
+                    expired += 1
+                else:
+                    self._transition(record, ConsumerReservationState.EXPIRE_PENDING)
+                    deferred += 1
         dropped = self._reap_tombstones(now)
         return expired, deferred, dropped
 
@@ -360,6 +431,16 @@ class ConsumerReservationManager:
         self._set_tombstone_deadline(record)
 
     def _release(self, record: ConsumerReservation) -> None:
+        if record.writer_id:
+            self._followers.get(record.writer_id, {}).pop(record.transfer_id, None)
+            record.allocation = None
+            return
+        if self._writers.get(record.mm_hash) is record:
+            self._writers.pop(record.mm_hash)
+        for transfer_id in list(self._followers.pop(record.transfer_id, {})):
+            follower = self._records[transfer_id]
+            self._terminate(follower, ConsumerReservationState.CANCELLED)
+            self._events.append(self._failed_event(follower, "shared writer failed"))
         allocation = record.allocation
         if allocation is None:
             return
@@ -369,6 +450,12 @@ class ConsumerReservationManager:
             self._memory.free(allocation)
         record.allocation = None
         record.lease = None
+
+    @classmethod
+    def _failed_event(cls, record: ConsumerReservation, error: str) -> dict[str, Any]:
+        event = cls._wire_event(record)
+        event.update(failed=True, error=error)
+        return event
 
     def _set_tombstone_deadline(self, record: ConsumerReservation) -> None:
         record.expires_at = time.monotonic() + self._lease_ttl

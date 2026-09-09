@@ -47,15 +47,27 @@ class StatusRequest(TypedDict):
     transfer_id: str
 
 
-class ReserveRequest(TypedDict):
-    """Request destination memory for an encoder-cache tensor."""
+class ReserveItem(TypedDict):
+    """Describe one encoder-cache destination reservation."""
 
-    op: Literal["reserve"]
     transfer_id: str
     mm_hash: str
     nbytes: int
     shape: list[int]
     dtype: str
+
+
+class ReserveRequest(ReserveItem):
+    """Request destination memory for an encoder-cache tensor."""
+
+    op: Literal["reserve"]
+
+
+class ReserveBatchRequest(TypedDict):
+    """Request destination memory for several independent tensors."""
+
+    op: Literal["reserve_batch"]
+    items: list[ReserveItem]
 
 
 class CompleteBatchRequest(TypedDict):
@@ -74,7 +86,14 @@ class ReservationActionRequest(ReservationItem):
     mm_hash: NotRequired[str]
 
 
-ControlRequest = EventPortRequest | StatusRequest | ReserveRequest | ReservationActionRequest | CompleteBatchRequest
+ControlRequest = (
+    EventPortRequest
+    | StatusRequest
+    | ReserveRequest
+    | ReserveBatchRequest
+    | ReservationActionRequest
+    | CompleteBatchRequest
+)
 
 
 class ControlSuccess(TypedDict):
@@ -270,6 +289,7 @@ class ConsumerControlServer:
         reap: Callable[[], int],
         metrics_log_interval: float = 10,
         device: torch.device | None = None,
+        drain_events: Callable[[], list[dict[str, Any]]] | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -280,6 +300,7 @@ class ConsumerControlServer:
         self._complete = complete
         self._cancel = cancel
         self._reap = reap
+        self._drain_events = drain_events or (lambda: [])
         self._metrics_log_interval = metrics_log_interval
         self._stop = threading.Event()
         self._started = threading.Event()
@@ -302,6 +323,18 @@ class ConsumerControlServer:
                     metrics["events_dropped"] += 1
                 pending_events.append(event)
                 metrics["events_queued"] += 1
+
+            def queue_drained_events() -> None:
+                try:
+                    for event in self._drain_events():
+                        queue_event(event)
+                except Exception:
+                    logger.exception("EC Mooncake could not drain reservation events")
+
+            def queue_ready(transfer_id: str) -> None:
+                status = self._status(transfer_id)
+                if status is not None:
+                    queue_event({"transfer_id": transfer_id, **status})
 
             metrics_started_at = time.monotonic()
             last_reap_at = metrics_started_at
@@ -329,6 +362,7 @@ class ConsumerControlServer:
                     now = time.monotonic()
                     if now - last_reap_at >= _RESERVATION_REAP_INTERVAL_SECONDS:
                         metrics["reservations_reaped"] += self._reap()
+                        queue_drained_events()
                         last_reap_at = now
                     if self._metrics_log_interval > 0 and now - metrics_started_at >= self._metrics_log_interval:
                         logger.info(
@@ -352,17 +386,28 @@ class ConsumerControlServer:
                         request = socket.recv_json()
                     except zmq.Again:
                         continue
+                    op = None
                     try:
                         op = request.get("op")
                         result: Any = None
                         metrics[f"request_{op}"] += 1
-                        if op == "reserve":
-                            result = self._reserve(request)
-                            if result.get("ready"):
-                                transfer_id = str(request["transfer_id"])
-                                status = self._status(transfer_id)
-                                if status is not None:
-                                    queue_event({"transfer_id": transfer_id, **status})
+                        if op in ("reserve", "reserve_batch"):
+                            items = request["items"] if op == "reserve_batch" else [request]
+                            results = []
+                            for item in items:
+                                try:
+                                    reserved = self._reserve(item)
+                                    results.append({"ok": True, "result": reserved})
+                                    if reserved.get("ready"):
+                                        queue_ready(str(item["transfer_id"]))
+                                except Exception as exc:
+                                    results.append({"ok": False, "error": str(exc)})
+                            if op == "reserve_batch":
+                                result = {"items": results}
+                            elif not results[0]["ok"]:
+                                raise RuntimeError(results[0]["error"])
+                            else:
+                                result = results[0]["result"]
                         elif op == "status":
                             result = self._status(str(request["transfer_id"]))
                         elif op == "event_port":
@@ -410,9 +455,19 @@ class ConsumerControlServer:
                                 )
                         else:
                             raise ValueError(f"unknown control op: {op!r}")
-                        socket.send_json({"ok": True, "result": result})
+                        response: ControlResponse = {"ok": True, "result": result}
                     except Exception as e:
-                        socket.send_json({"ok": False, "error": str(e)})
+                        response = {"ok": False, "error": str(e)}
+                    finally:
+                        if op in (
+                            "reserve",
+                            "reserve_batch",
+                            "complete",
+                            "complete_batch",
+                            "cancel",
+                        ):
+                            queue_drained_events()
+                    socket.send_json(response)
             finally:
                 socket.close(linger=0)
                 event_socket.close(linger=0)

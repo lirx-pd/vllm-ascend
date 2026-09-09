@@ -71,6 +71,7 @@ _LEASE_TTL_SECONDS = 300
 _RESERVATION_REFRESH_SECONDS = _LEASE_TTL_SECONDS / 2
 _MAX_CANCELLED_TRANSFER_IDS = 1 << 16
 _CANCEL_ATTEMPTS = 2
+_READY_EVENT_POLL_SECONDS = 0.001
 _PUSH_STAGES = (
     "reserve",
     "device",
@@ -209,8 +210,7 @@ class ECMooncakeWorker:
         self._io_executor = ThreadPoolExecutor(
             max_workers=config.transfer_workers,
             thread_name_prefix="ec-mooncake-transfer",
-            initializer=torch.npu.set_device,
-            initargs=(self._device,),
+            initializer=self._initialize_transfer_thread,
         )
         self._control_executor = ThreadPoolExecutor(
             max_workers=config.control_workers,
@@ -220,7 +220,10 @@ class ECMooncakeWorker:
         )
         self._fanout_pool: ThreadPoolExecutor | None = None
         self._fanout_pool_lock = threading.Lock()
-        self._producer_pushes = ProducerPushManager()
+        self._push_ready = threading.Event()
+        self._dispatch_stop = threading.Event()
+        self._dispatcher: threading.Thread | None = None
+        self._producer_pushes = ProducerPushManager(self._push_ready.set)
         self._push_perf_lock = threading.Lock()
         self._push_perf = _PushPerfWindow()
         self._active_transfer_batches = 0
@@ -228,6 +231,24 @@ class ECMooncakeWorker:
         self._completed_loads: set[str] = set()
         self._failed_loads: set[str] = set()
         self._shutdown = False
+        if self.is_producer:
+            self._dispatcher = threading.Thread(target=self._dispatch_pushes, name="ec-mooncake-ready", daemon=True)
+            self._dispatcher.start()
+
+    def _initialize_transfer_thread(self) -> None:
+        torch.npu.set_device(self._device)
+        # Staging must not synchronize later encoder work on the default stream.
+        torch.npu.set_stream(torch.npu.Stream(device=self._device))
+
+    def _dispatch_pushes(self) -> None:
+        torch.npu.set_device(self._device)
+        pending_event = False
+        while not self._dispatch_stop.is_set():
+            self._push_ready.wait(timeout=_READY_EVENT_POLL_SECONDS if pending_event else None)
+            self._push_ready.clear()
+            if self._dispatch_stop.is_set():
+                break
+            pending_event = self._flush_pending_pushes()
 
     def _log_timing(self, stage: str, duration_s: float, **fields: Any) -> None:
         if not self._timing_enabled:
@@ -263,6 +284,7 @@ class ECMooncakeWorker:
             self._expire_push_reservations,
             self._consumer_metrics_log_interval,
             device=consumer_pool.device,
+            drain_events=self._reservations.drain_events,
         )
         try:
             self._control_server.start()
@@ -632,11 +654,13 @@ class ECMooncakeWorker:
         **kwargs: Any,
     ) -> None:
         started_at = time.monotonic() if self._timing_enabled else None
+        new: dict[str, list[ProducerPushRecord]] = {}
         for spec in metadata.pushes:
-            self._producer_pushes.reserve(
-                spec,
-                partial(self._submit_reservation, spec),
-            )
+            record, created = self._producer_pushes.reserve(spec, Future)
+            if created:
+                new.setdefault(spec.consumer_zmq, []).append(record)
+        for records in new.values():
+            self._control_executor.submit(self._reserve_batch, records)
         if not isinstance(encoder_cache, dict):
             return
         for mm_hash in dict.fromkeys(spec.mm_hash for spec in metadata.pushes):
@@ -654,8 +678,69 @@ class ECMooncakeWorker:
                 status="ok",
             )
 
-    def _submit_reservation(self, spec: ECMooncakePushSpec) -> Future[list[dict[str, Any]]]:
-        return self._control_executor.submit(self._reserve_remote, spec)
+    def _reserve_batch(self, records: list[ProducerPushRecord]) -> None:
+        if len(records) == 1:
+            record = records[0]
+            try:
+                result = self._reserve_remote(record.spec)
+            except Exception as exc:
+                record.reservation_future.set_exception(exc)
+            else:
+                record.reservation_future.set_result(result)
+            return
+        started_at = time.monotonic()
+        addr = records[0].spec.consumer_zmq
+        try:
+            response = self._control_client.request(
+                addr,
+                {
+                    "op": "reserve_batch",
+                    "items": [
+                        {
+                            "transfer_id": record.spec.transfer_id,
+                            "mm_hash": record.spec.mm_hash,
+                            "nbytes": record.spec.nbytes,
+                            "shape": list(record.spec.shape),
+                            "dtype": record.spec.dtype,
+                        }
+                        for record in records
+                    ],
+                },
+            )
+            outcomes = response["items"]
+            if len(outcomes) != len(records):
+                raise RuntimeError("Malformed EC reservation batch response")
+        except Exception as exc:
+            outcomes = [{"ok": False, "error": str(exc)} for _ in records]
+        for record, outcome in zip(records, outcomes):
+            spec = record.spec
+            error = None
+            try:
+                if not outcome["ok"]:
+                    raise RuntimeError(outcome["error"])
+                reservation = outcome["result"]
+                reservation["addr"] = addr
+                reservation["_received_at"] = time.monotonic()
+            except Exception as exc:
+                error = exc
+            if error is None:
+                record.reservation_future.set_result([reservation])
+            else:
+                try:
+                    self._retry_cancel_reservations(spec, [{"addr": addr, "reservation_id": ""}])
+                except Exception:
+                    logger.exception("Failed to cancel rejected EC reservation for transfer_id=%s", spec.transfer_id)
+                record.reservation_future.set_exception(error)
+            if self._timing_enabled:
+                self._log_timing(
+                    "producer_reservation_completed",
+                    time.monotonic() - started_at,
+                    request_id=spec.request_id,
+                    transfer_id=spec.transfer_id,
+                    mm_hash=spec.mm_hash,
+                    boundary="control_batch_round_trip",
+                    status="ok" if error is None else "error",
+                )
 
     def start_load_caches(
         self,
@@ -1043,11 +1128,12 @@ class ECMooncakeWorker:
             stage_summary,
         )
 
-    def _flush_pending_pushes(self) -> None:
-        self._producer_pushes.submit_batches(
+    def _flush_pending_pushes(self, *, wait: bool = False) -> bool:
+        return self._producer_pushes.submit_batches(
             self._io_executor,
             self._push_batch,
             self._note_push_batch_queued,
+            wait=wait,
         )
 
     def _note_push_batch_queued(self) -> None:
@@ -1127,11 +1213,18 @@ class ECMooncakeWorker:
         if self._shutdown:
             return
         self._shutdown = True
-        self._flush_pending_pushes()
-        self._io_executor.shutdown(wait=True, cancel_futures=True)
+        self._dispatch_stop.set()
+        self._push_ready.set()
+        if self._dispatcher is not None:
+            self._dispatcher.join()
+        # Settle reservation futures before the final source drain.
+        self._control_executor.shutdown(wait=True)
+        for record in self._producer_pushes.cancel_requests(None):
+            self._producer_pushes.submit_cancel(record, self._io_executor, self._cancel_orphaned_reservation)
+        self._flush_pending_pushes(wait=True)
+        self._io_executor.shutdown(wait=True)
         if self._fanout_pool is not None:
             self._fanout_pool.shutdown(wait=True, cancel_futures=True)
-        self._control_executor.shutdown(wait=True, cancel_futures=True)
         # Every thread that could hold a control socket is stopped by now.
         self._control_client.close()
         if self._control_server is not None:

@@ -111,31 +111,119 @@ class TestReservationSharing(unittest.TestCase):
         self.reservations.retire_stale({"image": taken.tensor})
         self.assertEqual(self.memory.stats()[:3], (1, 1, 0))
 
-    def test_duplicate_writers_share_only_after_their_writes_complete(self):
+    def test_inflight_hash_shares_one_write_and_notifies_follower_ready(self):
         first, _, _, _ = self.reserve("first")
         second, write, _, _ = self.reserve("second")
-        self.assertTrue(write)
-        self.assertIsNot(first.allocation, second.allocation)
-        self.complete(first)
-        self.assertEqual(self.memory._allocator._free, [])
-        self.complete(second)
-        self.assertIs(second.allocation, first.allocation)
+        self.assertFalse(write)
+        self.assertIs(first.allocation, second.allocation)
         self.assertEqual(self.memory._allocator._free, [(256, 256)])
+        self.complete(first)
+        self.assertIs(second.allocation, first.allocation)
+        self.assertEqual(second.state, self.reservation_module.ConsumerReservationState.READY)
+        self.assertEqual(
+            self.reservations.drain_events(),
+            [
+                {
+                    "transfer_id": "second",
+                    "mm_hash": "image",
+                    "ready": True,
+                    "reservation_id": second.reservation_id,
+                    "shape": [256],
+                    "dtype": "uint8",
+                    "nbytes": 256,
+                }
+            ],
+        )
         self.cancel(first)
         self.assertIsNone(self.memory.reclaim_and_allocate(512, (512,), "uint8"))
         self.cancel(second)
         self.assertIsNotNone(self.memory.reclaim_and_allocate(512, (512,), "uint8"))
 
-    def test_cancelling_duplicate_writer_waits_for_completion(self):
+    def test_writer_cancel_waits_for_completion_then_fails_follower(self):
+        first, _, _, _ = self.reserve("first")
+        second, write, _, _ = self.reserve("second")
+        self.assertFalse(write)
+        outcome, _ = self.cancel(first)
+        self.assertIs(outcome, self.reservation_module.CancellationOutcome.DEFERRED)
+        self.assertEqual(self.memory._allocator._free, [(256, 256)])
+        self.assertTrue(self.complete(first).discarded)
+        self.assertEqual(self.memory._allocator._free, [(0, 512)])
+        self.assertEqual(second.state, self.reservation_module.ConsumerReservationState.CANCELLED)
+        self.assertEqual(
+            self.reservations.drain_events(),
+            [
+                {
+                    "transfer_id": "second",
+                    "mm_hash": "image",
+                    "ready": False,
+                    "reservation_id": second.reservation_id,
+                    "shape": [256],
+                    "dtype": "uint8",
+                    "failed": True,
+                    "error": "shared writer failed",
+                }
+            ],
+        )
+
+    def test_follower_cancel_does_not_cancel_writer(self):
         first, _, _, _ = self.reserve("first")
         second, _, _, _ = self.reserve("second")
-        self.complete(first)
         outcome, _ = self.cancel(second)
-        self.assertIs(outcome, self.reservation_module.CancellationOutcome.DEFERRED)
-        self.assertEqual(self.memory._allocator._free, [])
-        self.assertTrue(self.complete(second).discarded)
-        self.assertEqual(self.memory._allocator._free, [(256, 256)])
+        self.assertIs(outcome, self.reservation_module.CancellationOutcome.CANCELLED)
+        self.assertTrue(self.complete(first).became_ready)
+        self.assertEqual(self.reservations.drain_events(), [])
         self.assertEqual(self.reservations.take("first", "image").offset, 0)
+
+    def test_refreshing_writer_fails_follower_immediately(self):
+        first, _, _, _ = self.reserve("first")
+        second, _, _, _ = self.reserve("second")
+        outcome, _ = self.reservations.cancel(first.transfer_id, first.reservation_id, abandon=True, refresh=True)
+        self.assertIs(outcome, self.reservation_module.CancellationOutcome.CANCELLED)
+        event = self.reservations.drain_events()[0]
+        self.assertEqual(event["transfer_id"], second.transfer_id)
+        self.assertTrue(event["failed"])
+        self.assertEqual(self.memory._allocator._free, [(0, 512)])
+
+    def test_follower_expiry_notifies_failure_without_releasing_writer(self):
+        first, _, _, _ = self.reserve("first")
+        second, _, _, _ = self.reserve("second")
+        second.expires_at = 0
+        self.assertEqual(self.reservations.expire()[:2], (1, 0))
+        event = self.reservations.drain_events()[0]
+        self.assertEqual(event["transfer_id"], second.transfer_id)
+        self.assertEqual(event["error"], "reservation expired")
+        self.assertEqual(self.memory._allocator._free, [(256, 256)])
+        self.assertTrue(self.complete(first).became_ready)
+
+    def test_writer_expiry_fails_multiple_followers_after_completion(self):
+        writer, _, _, _ = self.reserve("writer")
+        followers = [self.reserve(name)[0] for name in ("second", "third")]
+        writer.expires_at = 0
+        self.assertEqual(self.reservations.expire()[:2], (0, 1))
+        self.assertEqual(self.reservations.drain_events(), [])
+        self.assertTrue(self.complete(writer).discarded)
+        events = self.reservations.drain_events()
+        self.assertEqual(
+            {event["transfer_id"] for event in events},
+            {record.transfer_id for record in followers},
+        )
+        self.assertTrue(all(event["failed"] for event in events))
+        self.assertEqual(self.memory._allocator._free, [(0, 512)])
+
+    def test_multiple_followers_hold_independent_ready_leases(self):
+        writer, _, _, _ = self.reserve("writer")
+        second, _, _, _ = self.reserve("second")
+        third, _, _, _ = self.reserve("third")
+        self.complete(writer)
+        self.assertEqual(
+            {event["transfer_id"] for event in self.reservations.drain_events()},
+            {"second", "third"},
+        )
+        taken = self.reservations.take(second.transfer_id, "image")
+        self.cancel(writer)
+        self.assertIsNone(self.memory.reclaim_and_allocate(512, (512,), "uint8"))
+        self.cancel(third)
+        self.assertEqual(taken.offset, 0)
 
     def test_reserved_hash_does_not_keep_old_model_pin_after_cache_release(self):
         first, _, _, _ = self.reserve("first")

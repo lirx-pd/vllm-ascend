@@ -128,7 +128,8 @@ class ProducerPushManager:
         _lock: Reentrant lock protecting lifecycle and ownership changes.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, wake: Callable[[], None] = lambda: None) -> None:
+        self._wake = wake
         self._records: OrderedDict[str, ProducerPushRecord] = OrderedDict()
         self._active_ids: OrderedDict[str, None] = OrderedDict()
         self._reapable_terminal_ids: OrderedDict[str, None] = OrderedDict()
@@ -177,13 +178,17 @@ class ProducerPushManager:
                     continue
                 record.source = ProducerSourceLease(tensor, ready_event)
                 record.source_at = time.monotonic()
+        self._wake()
 
     def submit_batches(
         self,
         executor: ThreadPoolExecutor,
         run_batch: Callable[[list[ProducerPushRecord]], None],
         on_submit: Callable[[], None],
-    ) -> None:
+        *,
+        wait: bool = False,
+    ) -> bool:
+        pending_event = False
         with self._lock:
             grouped: dict[str, list[ProducerPushRecord]] = {}
             for transfer_id in list(self._active_ids):
@@ -193,8 +198,13 @@ class ProducerPushManager:
                     and record.batch_future is None
                     and record.state in _SOURCE_WAIT_STATES
                     and record.reservation_future.done()
+                    and not record.reservation_future.cancelled()
                     and record.reservation_future.exception() is None
                 ):
+                    event = record.source.ready_event
+                    if event is not None and not wait and not event.query():
+                        pending_event = True
+                        continue
                     grouped.setdefault(record.spec.consumer_zmq, []).append(record)
             batches = list(grouped.values())
             for records in batches:
@@ -203,6 +213,7 @@ class ProducerPushManager:
                 for record in records:
                     record.batch_future = future
                     self._batch_ids[record.spec.transfer_id] = None
+        return pending_event
 
     def resolve_reservations(self, record: ProducerPushRecord) -> list[dict[str, Any]]:
         results = record.reservation_future.result()
@@ -229,6 +240,7 @@ class ProducerPushManager:
         with self._lock:
             if record.state is ProducerPushState.RESERVING:
                 self._transition(record, ProducerPushState.WAITING_SOURCE)
+        self._wake()
 
     def settle_all(self, records: list[ProducerPushRecord]) -> None:
         for record in records:
@@ -279,13 +291,14 @@ class ProducerPushManager:
                     self._transition(record, ProducerPushState.FAILED)
                 self._release_source(record)
 
-    def cancel_requests(self, request_ids: set[str]) -> list[ProducerPushRecord]:
+    def cancel_requests(self, request_ids: set[str] | None) -> list[ProducerPushRecord]:
+        """Cancel unbound sources; None selects every request during shutdown."""
         cancelled = []
         with self._lock:
             for transfer_id in list(self._active_ids):
                 record = self._records[transfer_id]
                 if (
-                    record.spec.request_id not in request_ids
+                    (request_ids is not None and record.spec.request_id not in request_ids)
                     or record.source is not None
                     or record.batch_future is not None
                 ):

@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
+import io
 import itertools
 import json
 import logging
@@ -33,6 +35,7 @@ from collections.abc import AsyncIterator
 from contextlib import contextmanager
 
 import aiohttp
+import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -154,12 +157,13 @@ def content_uuid(item: dict) -> str:
 
 
 def rewrite_for_decode(req_data: dict, item_meta: dict[int, dict]) -> dict:
-    """Preserve media and attach the identity used by the encoder's EC push.
-
-    The pinned vLLM requires media to derive placeholders: it does not support
-    metadata-only embedding inputs. CPU preprocessing must use the producer's
-    UUID so the consumer can load its NPU embedding through Mooncake.
-    """
+    """Reuse the encoder's image grid while Mooncake delivers the embedding."""
+    # The frontend cannot mix raw images and embedding inputs in one request.
+    reuse_image_grids = all(
+        "image_grid_thw" in item_meta[index]
+        for index, item in enumerate(extract_mm_items(req_data))
+        if item["type"] == "image_url"
+    )
     transfer_items = []
     idx = 0
     new_messages = []
@@ -176,7 +180,19 @@ def rewrite_for_decode(req_data: dict, item_meta: dict[int, dict]) -> dict:
             meta = item_meta[idx]
             idx += 1
             item_uuid = meta["mm_hash"]
-            new_content.append({**item, "uuid": item_uuid})
+            if item["type"] == "image_url" and reuse_image_grids:
+                buffer = io.BytesIO()
+                torch.save(torch.tensor(meta["image_grid_thw"]).flatten(), buffer)
+                new_content.append(
+                    {
+                        "type": "image_embeds",
+                        "image_embeds": {"image_grid_thw": base64.b64encode(buffer.getvalue()).decode()},
+                        "uuid": item_uuid,
+                    }
+                )
+            else:
+                # Missing grid metadata still requires media to size placeholders.
+                new_content.append({**item, "uuid": item_uuid})
             transfer_items.append({"mm_hash": item_uuid, "transfer_id": meta["transfer_id"]})
         new_messages.append({**msg, "content": new_content})
 
@@ -230,8 +246,7 @@ async def fanout_encoder_primer(
     2. Send them concurrently to the encode cluster.
     3. Raise if any of them fails.
 
-    Return the EC identity sent to each encoder, independent of whether its
-    response contains grid metadata. Both sides must use the same cache key.
+    Return each encoder's identity and available image placeholder metadata.
     """
     logger.info("[%s] Processing multimodal items...", req_id)
 
@@ -320,14 +335,16 @@ async def fanout_encoder_primer(
                     detail=f"Encoder request failed: {detail}",
                 )
 
-            # Drain the response before reusing the connection. The proxy already
-            # knows the identity sent to the encoder; grid metadata is not needed.
-            await r.read()
+            response_data = json.loads(await r.read())
             if idx in item_uuids:
                 item_meta[idx] = {
                     "mm_hash": item_uuids[idx],
                     "transfer_id": item_transfer_ids[idx],
                 }
+                for reported in (response_data.get("ec_transfer_params") or {}).get("ec_items", []):
+                    if reported.get("mm_hash") == item_uuids[idx] and "image_grid_thw" in reported:
+                        item_meta[idx]["image_grid_thw"] = reported["image_grid_thw"]
+                        break
     finally:
         for response in results:
             if not isinstance(response, BaseException):

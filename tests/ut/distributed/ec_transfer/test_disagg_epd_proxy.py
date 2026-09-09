@@ -2,13 +2,16 @@
 """CPU-only regression tests for the proxy's Mooncake request identity."""
 
 import asyncio
+import base64
 import copy
 import importlib.util
+import io
 import json
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import torch
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
@@ -19,6 +22,57 @@ _spec.loader.exec_module(proxy)
 
 
 class ProxyIdentityTest(unittest.IsolatedAsyncioTestCase):
+    async def test_per_image_round_robin_and_metadata_only_decode(self):
+        image = {"type": "image_url", "image_url": {"url": "test.png"}}
+        request = {"messages": [{"content": [image, image, image]}]}
+
+        async def encode(url, **kwargs):
+            transfer = kwargs["json"]["ec_transfer_params"]["ec_items"][0]
+            response = MagicMock(status=200)
+            response.read = AsyncMock(
+                return_value=json.dumps(
+                    {"ec_transfer_params": {"ec_items": [{**transfer, "image_grid_thw": [[1, 32, 32]]}]}}
+                ).encode()
+            )
+            return response
+
+        session = AsyncMock()
+        session.post.side_effect = encode
+        with (
+            patch.object(proxy, "encode_session", session),
+            patch.object(proxy, "NO_REWRITE", False),
+            patch.object(proxy, "encoder_rr_idx", 0),
+        ):
+            for req_id in ("first", "second"):
+                metadata = await proxy.fanout_encoder_primer(
+                    request, ["http://e0", "http://e1"], req_id, "tcp://pd:29600"
+                )
+                forwarded = proxy.rewrite_for_decode(request, metadata)
+                for item in forwarded["messages"][0]["content"]:
+                    self.assertEqual(item["type"], "image_embeds")
+                    self.assertNotIn("image_url", item)
+                    grid = torch.load(
+                        io.BytesIO(base64.b64decode(item["image_embeds"]["image_grid_thw"])), weights_only=True
+                    )
+                    self.assertEqual(grid.tolist(), [1, 32, 32])
+                    self.assertEqual(item["uuid"], proxy.content_uuid(image))
+        self.assertEqual(
+            [call.args[0] for call in session.post.call_args_list],
+            [f"http://e{index % 2}/v1/chat/completions" for index in range(6)],
+        )
+        for call in session.post.call_args_list:
+            self.assertEqual(call.kwargs["json"]["ec_transfer_params"]["consumer_zmq"], "tcp://pd:29600")
+
+    def test_partial_metadata_keeps_all_images_raw(self):
+        image = {"type": "image_url", "image_url": {"url": "test.png"}}
+        request = {"messages": [{"content": [image, image]}]}
+        metadata = {
+            0: {"mm_hash": "same", "transfer_id": "a", "image_grid_thw": [[1, 32, 32]]},
+            1: {"mm_hash": "same", "transfer_id": "b"},
+        }
+        forwarded = proxy.rewrite_for_decode(request, metadata)
+        self.assertEqual([item["type"] for item in forwarded["messages"][0]["content"]], ["image_url", "image_url"])
+
     async def test_encoder_and_consumer_keep_same_identity(self):
         for response_body in (b"{}", b'{"ec_transfer_params":{"ec_items":[{"image_grid_thw":[[1,32,32]]}]}}'):
             with self.subTest(response_body=response_body):

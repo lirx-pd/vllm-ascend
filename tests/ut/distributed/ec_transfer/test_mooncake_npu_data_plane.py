@@ -353,6 +353,97 @@ class TestMooncakeNPUDataPlane(unittest.TestCase):
             client.close()
             server.close()
 
+    def test_reserve_batch_isolates_failures_and_emits_all_ready_events(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+
+        def reserve(item):
+            if item["transfer_id"] == "failed":
+                raise RuntimeError("buffer pool is full")
+            return {
+                "reservation_id": f"reservation-{item['transfer_id']}",
+                "ready": item["transfer_id"] == "ready",
+            }
+
+        statuses = {
+            "ready": {"mm_hash": "ready-hash", "ready": True},
+        }
+        follower_event = {
+            "transfer_id": "follower",
+            "mm_hash": "shared-hash",
+            "ready": True,
+        }
+        drained = [[follower_event], []]
+        control = self.control_module
+        server = control.ConsumerControlServer(
+            "127.0.0.1",
+            port,
+            reserve,
+            statuses.get,
+            MagicMock(),
+            MagicMock(),
+            lambda: 0,
+            0,
+            drain_events=lambda: drained.pop(0) if drained else [],
+        )
+        client = control.ControlClient(1000)
+        inbox = control.EventInbox(client)
+        addr = f"tcp://127.0.0.1:{port}"
+
+        def item(transfer_id):
+            return {
+                "transfer_id": transfer_id,
+                "mm_hash": f"{transfer_id}-hash",
+                "nbytes": 4,
+                "shape": [1],
+                "dtype": "float32",
+            }
+
+        try:
+            server.start()
+            inbox._connect(addr)
+            result = client.request(
+                addr,
+                {
+                    "op": "reserve_batch",
+                    "items": [item("failed"), item("ready"), item("new")],
+                },
+            )
+            self.assertEqual(
+                result["items"],
+                [
+                    {"ok": False, "error": "buffer pool is full"},
+                    {
+                        "ok": True,
+                        "result": {"reservation_id": "reservation-ready", "ready": True},
+                    },
+                    {
+                        "ok": True,
+                        "result": {"reservation_id": "reservation-new", "ready": False},
+                    },
+                ],
+            )
+            with self.assertRaisesRegex(RuntimeError, "buffer pool is full"):
+                client.request(addr, {"op": "reserve", **item("failed")})
+
+            events = []
+            deadline = time.monotonic() + 2
+            while len(events) < 2 and time.monotonic() < deadline:
+                events.extend(inbox.drain(addr))
+                time.sleep(0.01)
+            self.assertCountEqual(
+                events,
+                [
+                    {"transfer_id": "ready", "mm_hash": "ready-hash", "ready": True},
+                    follower_event,
+                ],
+            )
+        finally:
+            inbox.close()
+            client.close()
+            server.close()
+
     @staticmethod
     def _request(transfer_id):
         return SimpleNamespace(

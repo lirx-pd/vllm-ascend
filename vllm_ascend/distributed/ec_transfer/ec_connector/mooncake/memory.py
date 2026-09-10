@@ -12,7 +12,7 @@ from __future__ import annotations
 import bisect
 import math
 import threading
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Generic, TypeVar
@@ -143,10 +143,6 @@ class ResidentPool(Generic[_T]):
 
     def __len__(self) -> int:
         return len(self._entries)
-
-    @property
-    def num_evictable(self) -> int:
-        return len(self._evictable)
 
     def referenced(self) -> list[str]:
         return [key for key, entry in self._entries.items() if entry.pinned]
@@ -361,7 +357,6 @@ class ConsumerMemoryPool:
     Attributes:
         _capacity: Requested receive-slab size in bytes.
         _transfer: Data-plane owner used to register the slab.
-        _metrics: Counters describing resident-cache behavior.
         _pool: Registered byte tensor that receives Mooncake writes.
         _allocator: Region allocator for the receive slab.
         _residents: Published allocations available for local reuse.
@@ -378,7 +373,6 @@ class ConsumerMemoryPool:
     ) -> None:
         self._capacity = capacity
         self._transfer = transfer
-        self._metrics: Counter[str] = Counter()
         self._pool: torch.Tensor | None = None
         self._allocator: ContiguousAllocator | None = None
         self._residents: ResidentPool[MemoryAllocation] = ResidentPool()
@@ -448,7 +442,6 @@ class ConsumerMemoryPool:
             event = self._retire_events.pop(mm_hash, None)
             self._defer_or_free(allocation, event)
             self._reclaimed.add(mm_hash)
-            self._metrics["residents_reclaimed"] += 1
             return True
 
         while self._residents.evict_lru(evict) is not None:
@@ -501,15 +494,12 @@ class ConsumerMemoryPool:
         with self.lock:
             allocation = self._residents.get(mm_hash)
             if allocation is None:
-                self._metrics["residents_missed"] += 1
                 return None
             tensor = allocation.tensor
             if tuple(tensor.shape) != shape or str(tensor.dtype).split(".")[-1] != dtype_name:
-                self._metrics["residents_mismatched"] += 1
                 return None
             self._residents.pin(mm_hash)
             self._retire_events.pop(mm_hash, None)
-            self._metrics["residents_promoted"] += 1
             return tensor
 
     def _record_release_event(self) -> torch.npu.Event | None:
@@ -582,7 +572,6 @@ class ConsumerMemoryPool:
                 event.record(torch.npu.current_stream(self._pool.device))
                 self._retire_events[mm_hash] = event
                 self._residents.retire(mm_hash)
-                self._metrics["residents_retired"] += 1
             self._poll_frees_locked()
 
     def drain_reclaimed(self) -> set[str]:
@@ -590,21 +579,6 @@ class ConsumerMemoryPool:
             reclaimed = self._reclaimed
             self._reclaimed = set()
             return reclaimed
-
-    def stats(self) -> tuple[int, int, int, int]:
-        with self.lock:
-            return (
-                len(self._residents),
-                len(self._residents.referenced()),
-                self._residents.num_evictable,
-                len(self._pending_frees),
-            )
-
-    def take_metrics(self) -> dict[str, int]:
-        with self.lock:
-            metrics = dict(self._metrics)
-            self._metrics.clear()
-            return metrics
 
     def close(self) -> None:
         with self.lock:

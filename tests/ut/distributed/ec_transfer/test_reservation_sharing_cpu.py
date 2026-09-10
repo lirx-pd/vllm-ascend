@@ -109,7 +109,9 @@ class TestReservationSharing(unittest.TestCase):
         taken = self.reservations.take("second", "image")
         self.assertEqual(taken.offset, 0)
         self.reservations.retire_stale({"image": taken.tensor})
-        self.assertEqual(self.memory.stats()[:3], (1, 1, 0))
+        self.assertEqual(len(self.memory._residents), 1)
+        self.assertEqual(self.memory._residents.referenced(), ["image"])
+        self.assertEqual(list(self.memory._residents._evictable), [])
 
     def test_inflight_hash_shares_one_write_and_notifies_follower_ready(self):
         first, _, _, _ = self.reserve("first")
@@ -232,9 +234,13 @@ class TestReservationSharing(unittest.TestCase):
         second, write, _, _ = self.reserve("second")
         self.assertFalse(write)
         self.reservations.retire_stale({})
-        self.assertEqual(self.memory.stats()[:3], (1, 0, 0))
+        self.assertEqual(len(self.memory._residents), 1)
+        self.assertEqual(self.memory._residents.referenced(), [])
+        self.assertEqual(list(self.memory._residents._evictable), [])
         self.cancel(second)
-        self.assertEqual(self.memory.stats()[:3], (1, 0, 1))
+        self.assertEqual(len(self.memory._residents), 1)
+        self.assertEqual(self.memory._residents.referenced(), [])
+        self.assertEqual(list(self.memory._residents._evictable), ["image"])
         self.assertIsNone(self.memory.reclaim_and_allocate(512, (512,), "uint8"))
         self.assertEqual(self.memory._pending_frees[0][1], taken)
         self.events[0].done = True

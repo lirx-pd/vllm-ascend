@@ -9,7 +9,6 @@ orchestration performs the actual control exchanges and Mooncake writes.
 from __future__ import annotations
 
 import threading
-import time
 from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -65,7 +64,6 @@ class ProducerPushRecord:
         source: Source tensor lease once encoder computation has completed.
         batch_future: Transfer or cancellation batch currently owning the push.
         error: First asynchronous error retained for Worker reporting.
-        source_at: Time the source became available for queue metrics.
     """
 
     spec: ECMooncakePushSpec
@@ -76,7 +74,6 @@ class ProducerPushRecord:
     source: ProducerSourceLease | None = None
     batch_future: Future[None] | None = None
     error: str | None = None
-    source_at: float | None = None
 
 
 _ALLOWED_TRANSITIONS = {
@@ -178,14 +175,12 @@ class ProducerPushManager:
                 if record.source is not None or record.state not in _SOURCE_WAIT_STATES:
                     continue
                 record.source = ProducerSourceLease(tensor, ready_event)
-                record.source_at = time.monotonic()
         self._wake()
 
     def submit_batches(
         self,
         executor: ThreadPoolExecutor,
         run_batch: Callable[[list[ProducerPushRecord]], None],
-        on_submit: Callable[[], None],
         *,
         max_batch_bytes: int,
         wait: bool = False,
@@ -228,7 +223,6 @@ class ProducerPushManager:
                 if batch:
                     batches.append(batch)
             for records in batches:
-                on_submit()
                 future = executor.submit(run_batch, records)
                 for record in records:
                     record.batch_future = future

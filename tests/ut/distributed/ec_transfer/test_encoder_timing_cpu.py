@@ -132,13 +132,13 @@ class TestEncoderTiming(unittest.TestCase):
                 self.clock.assert_not_called()
                 self.logger.info.assert_not_called()
 
-    def test_legacy_connector_toggle_is_supported(self):
+    def test_removed_connector_toggle_does_not_enable_timing(self):
         runner = self.make_runner("encoder", enabled=False, legacy_enabled=True)
 
         runner._execute_mm_encoder(self.scheduler_output)
 
-        self.assertEqual(self.clock.call_count, 2)
-        self.logger.info.assert_called_once()
+        self.clock.assert_not_called()
+        self.logger.info.assert_not_called()
 
     def test_error_is_recorded_and_reraised(self):
         runner = self.make_runner("pd")

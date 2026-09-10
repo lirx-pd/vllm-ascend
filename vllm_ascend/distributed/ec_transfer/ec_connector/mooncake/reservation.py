@@ -125,7 +125,7 @@ class CompletionResult:
 
 
 class CancellationOutcome(Enum):
-    """Outcome categories used for control responses and metrics."""
+    """Outcome categories used for control responses."""
 
     REJECTED = auto()
     PRE_RESERVED = auto()
@@ -163,9 +163,6 @@ class ConsumerReservationManager:
 
     def get(self, transfer_id: str) -> ConsumerReservation | None:
         return self._records.get(transfer_id)
-
-    def active_records(self) -> list[ConsumerReservation]:
-        return [self._records[transfer_id] for transfer_id in self._active_ids]
 
     def reserve(
         self,

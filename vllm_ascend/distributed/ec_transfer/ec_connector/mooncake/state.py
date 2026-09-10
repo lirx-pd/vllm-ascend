@@ -149,9 +149,6 @@ class SchedulerTransferTable:
     def has_state(self, mm_hash: str, states: Iterable[SchedulerTransferState]) -> bool:
         return self.first_for_hash(mm_hash, states) is not None
 
-    def count(self, state: SchedulerTransferState) -> int:
-        return sum(record.state is state for record in self._records.values())
-
     @property
     def resident_bytes(self) -> int:
         return sum(

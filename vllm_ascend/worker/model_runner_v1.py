@@ -678,11 +678,7 @@ class NPUModelRunner(GPUModelRunner):
     ) -> list[torch.Tensor]:
         scheduled_inputs = scheduler_output.scheduled_encoder_inputs
         ec_config = self.vllm_config.ec_transfer_config
-        timing_enabled = self.ascend_config.epd_profile or (
-            ec_config is not None
-            and ec_config.ec_connector_extra_config.get("timing_enabled", False)
-        )
-        if not timing_enabled or not scheduled_inputs:
+        if not self.ascend_config.epd_profile or not scheduled_inputs:
             return super()._execute_mm_encoder(scheduler_output)
 
         if ec_config is None:

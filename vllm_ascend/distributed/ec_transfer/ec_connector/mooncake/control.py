@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import Counter, deque
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict, cast
@@ -271,7 +271,6 @@ class ConsumerControlServer:
         _complete: Callback that marks destination writes complete.
         _cancel: Callback that cancels or abandons reservations.
         _reap: Callback that expires stale reservations.
-        _metrics_log_interval: Interval for aggregate control-plane logs.
         _stop: Signal requesting termination of the server loop.
         _started: Signal indicating that socket binding has completed.
         _thread: Background server thread.
@@ -287,7 +286,6 @@ class ConsumerControlServer:
         complete: Callable[[str, str], ControlCompletion],
         cancel: Callable[[str, str, bool, bool], bool],
         reap: Callable[[], int],
-        metrics_log_interval: float = 10,
         device: torch.device | None = None,
         drain_events: Callable[[], list[dict[str, Any]]] | None = None,
     ) -> None:
@@ -301,7 +299,6 @@ class ConsumerControlServer:
         self._cancel = cancel
         self._reap = reap
         self._drain_events = drain_events or (lambda: [])
-        self._metrics_log_interval = metrics_log_interval
         self._stop = threading.Event()
         self._started = threading.Event()
         self._thread: threading.Thread | None = None
@@ -315,14 +312,11 @@ class ConsumerControlServer:
             socket = context.socket(zmq.REP)
             event_socket = context.socket(zmq.PUSH)
             pending_events: deque[dict[str, Any]] = deque()
-            metrics: Counter[str] = Counter()
 
             def queue_event(event: dict[str, Any]) -> None:
                 if len(pending_events) >= _MAX_PENDING_EVENTS:
                     pending_events.popleft()
-                    metrics["events_dropped"] += 1
                 pending_events.append(event)
-                metrics["events_queued"] += 1
 
             def queue_drained_events() -> None:
                 try:
@@ -336,8 +330,7 @@ class ConsumerControlServer:
                 if status is not None:
                     queue_event({"transfer_id": transfer_id, **status})
 
-            metrics_started_at = time.monotonic()
-            last_reap_at = metrics_started_at
+            last_reap_at = time.monotonic()
             socket.setsockopt(zmq.RCVTIMEO, 100)
             try:
                 socket.bind(f"tcp://{self.host}:{self.port}")
@@ -358,30 +351,11 @@ class ConsumerControlServer:
                         except zmq.Again:
                             break
                         pending_events.popleft()
-                        metrics["events_sent"] += 1
                     now = time.monotonic()
                     if now - last_reap_at >= _RESERVATION_REAP_INTERVAL_SECONDS:
-                        metrics["reservations_reaped"] += self._reap()
+                        self._reap()
                         queue_drained_events()
                         last_reap_at = now
-                    if self._metrics_log_interval > 0 and now - metrics_started_at >= self._metrics_log_interval:
-                        logger.info(
-                            "EC Mooncake consumer control: requests=%s, "
-                            "events_queued=%d, events_sent=%d, events_dropped=%d, "
-                            "event_backlog=%d, reservations_reaped=%d",
-                            {
-                                key.removeprefix("request_"): value
-                                for key, value in metrics.items()
-                                if key.startswith("request_")
-                            },
-                            metrics["events_queued"],
-                            metrics["events_sent"],
-                            metrics["events_dropped"],
-                            len(pending_events),
-                            metrics["reservations_reaped"],
-                        )
-                        metrics.clear()
-                        metrics_started_at = now
                     try:
                         request = socket.recv_json()
                     except zmq.Again:
@@ -390,10 +364,9 @@ class ConsumerControlServer:
                     try:
                         op = request.get("op")
                         result: Any = None
-                        metrics[f"request_{op}"] += 1
                         if op in ("reserve", "reserve_batch"):
                             items = request["items"] if op == "reserve_batch" else [request]
-                            metrics["reservations_reaped"] += self._reap()
+                            self._reap()
                             last_reap_at = time.monotonic()
                             results = []
                             for item in items:

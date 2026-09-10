@@ -24,6 +24,7 @@ import torch
 from vllm.compilation import breakable_cudagraph
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -61,6 +62,7 @@ from vllm_ascend.utils import lmhead_tp_enable, set_potential_max_tokens, vllm_v
 from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
+from vllm_ascend.worker.v2.ec_connector import AscendECConnector
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
@@ -101,6 +103,11 @@ class NPUModelRunner(GPUModelRunner):
                 super().__init__(vllm_config, device)
             if pp_disabled:
                 restore_pp_after_upstream_init(self, vllm_config)
+        if has_ec_transfer() and self.encoder_cache is not None and not self.is_encoder_decoder:
+            from vllm_ascend.distributed.ec_transfer.ec_connector.mooncake_ec_connector import ECMooncakeConnector
+
+            if isinstance(get_ec_transfer(), ECMooncakeConnector):
+                self.ec_connector = AscendECConnector(vllm_config, self.encoder_cache)
         self.use_spec_pp = spec_pp_support is not None
         # These draft heads consume target aux states collected across PP ranks.
         if spec_pp_support is not None and spec_pp_support.needs_aux_hidden_states:

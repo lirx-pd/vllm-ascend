@@ -218,6 +218,7 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataTask,
     DeviceMetadataTaskProvider,
 )
+from vllm_ascend.worker.ec_connector import ec_connector_output
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import AscendKVBlockZeroer, disable_compilation
 
@@ -733,33 +734,12 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     @staticmethod
-    @contextmanager
     def _get_ec_connector_output(
         scheduler_output: "SchedulerOutput",
         encoder_cache: dict[str, torch.Tensor],
         **kwargs,
     ):
-        """Run the extended EC lifecycle missing from the pinned vLLM mixin."""
-        output = ECConnectorOutput()
-        connector = get_ec_transfer()
-        metadata = scheduler_output.ec_connector_metadata
-        if metadata is None:
-            raise RuntimeError("EC connector metadata is required")
-        connector.bind_connector_metadata(metadata)
-
-        if connector.is_producer:
-            connector.start_save_caches(encoder_cache=encoder_cache, **kwargs)
-        if connector.is_consumer:
-            connector.start_load_caches(encoder_cache, **kwargs)
-
-        try:
-            yield output
-        finally:
-            output.finished_sending, output.finished_recving = connector.get_finished(
-                scheduler_output.finished_req_ids
-            )
-            output.ec_connector_worker_meta = connector.build_connector_worker_meta()
-            connector.clear_connector_metadata()
+        return ec_connector_output(get_ec_transfer(), scheduler_output, encoder_cache, **kwargs)
 
     def _no_forward_output(self, scheduler_output: "SchedulerOutput"):
         output = (

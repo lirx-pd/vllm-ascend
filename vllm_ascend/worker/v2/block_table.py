@@ -64,7 +64,7 @@ class AscendBlockTables(BlockTables):
         # The kernel block-table row can be wider than
         # max_num_blocks_per_group when one KV block maps to multiple kernel
         # blocks. Use the allocated row stride so the staged row is complete.
-        max_block_table_stride = max(block_table.gpu.stride(0) for block_table in self.block_tables)
+        max_block_table_stride = max((block_table.gpu.stride(0) for block_table in self.block_tables), default=1)
         # tl.arange needs a compile-time power-of-two size. This value is
         # passed as a constexpr and covers every KV cache group's row.
         self._block_table_pad_size = triton.next_power_of_2(max_block_table_stride)
@@ -91,6 +91,8 @@ class AscendBlockTables(BlockTables):
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
+        if num_groups == 0:
+            return slot_mappings[:, :num_tokens_padded]
         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
             slot_mappings.shape[1],
             idx_mapping,

@@ -9,9 +9,21 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
+from vllm_ascend.worker.v2.block_table import AscendBlockTables
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+
+
+def test_encoder_only_block_tables_have_no_kv_groups():
+    with patch("vllm.v1.worker.gpu.block_table.UvaBackedTensor"):
+        block_tables = AscendBlockTables([], 4, 16, [], torch.device("cpu"))
+    assert block_tables.gather_block_tables(torch.tensor([0]), 1) == ()
+    with patch("vllm_ascend.worker.v2.block_table._compute_slot_mappings_kernel") as kernel:
+        slots = block_tables.compute_slot_mappings(torch.tensor([0]), torch.tensor([0, 4]), torch.arange(4), 4)
+    assert slots.shape == (0, 4)
+    assert slots.dtype == torch.int32
+    kernel.__getitem__.assert_not_called()
 
 
 def _make_runner(need_timing: bool = True):

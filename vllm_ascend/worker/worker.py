@@ -507,7 +507,12 @@ class NPUWorker(WorkerBase):
             logger.warning("npu model runner v2 is in developing, some features doesn't work for now.")
             from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 
-            self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
+            if self.vllm_config.is_mm_encoder_only:
+                from vllm_ascend.worker.v2.mm_encoder_model_runner import NPUEncoderModelRunner
+
+                self.model_runner = NPUEncoderModelRunner(self.vllm_config, self.device)
+            else:
+                self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 

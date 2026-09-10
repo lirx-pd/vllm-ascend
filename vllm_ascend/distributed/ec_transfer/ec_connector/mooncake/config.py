@@ -55,12 +55,6 @@ def _nonempty_string(name: str, value: object) -> str:
     return value.strip()
 
 
-def _boolean(name: str, value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    raise ValueError(f"ECMooncakeConnector requires {name} to be a boolean.")
-
-
 @dataclass(frozen=True)
 class MooncakeECConfig:
     """Validated runtime settings for one Scheduler or Worker instance.
@@ -78,9 +72,6 @@ class MooncakeECConfig:
         control_workers: Maximum concurrent control-plane operations.
         producer_pool_size: Bytes reserved for the Producer staging pool.
         consumer_pool_size: Bytes reserved for the Consumer receive pool.
-        transfer_metrics_log_interval: Producer transfer log interval in seconds.
-        consumer_metrics_log_interval: Consumer metrics log interval in seconds.
-        timing_enabled: Whether to emit per-operation structured timing logs.
     """
 
     is_producer: bool
@@ -95,9 +86,6 @@ class MooncakeECConfig:
     control_workers: int
     producer_pool_size: int
     consumer_pool_size: int
-    transfer_metrics_log_interval: float
-    consumer_metrics_log_interval: float
-    timing_enabled: bool = False
 
     @property
     def control_timeout_ms(self) -> int:
@@ -202,15 +190,4 @@ class MooncakeECConfig:
             control_workers=control_workers,
             producer_pool_size=producer_pool_size,
             consumer_pool_size=consumer_pool_size,
-            transfer_metrics_log_interval=_finite_float(
-                "transfer_metrics_log_interval",
-                extra.get("transfer_metrics_log_interval", 10),
-                True,
-            ),
-            consumer_metrics_log_interval=_finite_float(
-                "consumer_metrics_log_interval",
-                extra.get("consumer_metrics_log_interval", 10),
-                True,
-            ),
-            timing_enabled=_boolean("timing_enabled", extra.get("timing_enabled", False)),
         )

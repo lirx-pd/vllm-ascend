@@ -7,6 +7,7 @@ import ast
 import logging
 import sys
 import threading
+import time
 import types
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -48,6 +49,7 @@ def _load_classes():
     }
     worker.body = [node for node in worker.body if isinstance(node, ast.FunctionDef) and node.name in methods]
     module.Future = Future
+    module.time = time
     module.logger = logging.getLogger(name)
     module._READY_EVENT_POLL_SECONDS = 0.001
     tree.body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), worker]
@@ -93,11 +95,11 @@ class TestProducerDispatch(unittest.TestCase):
             manager.bind_source(name, object(), event)
             records.append(record)
         executor = MagicMock()
-        self.assertTrue(manager.submit_batches(executor, MagicMock(), MagicMock(), max_batch_bytes=1024))
+        self.assertTrue(manager.submit_batches(executor, MagicMock(), max_batch_bytes=1024))
         self.assertEqual(executor.submit.call_args.args[1], [records[1]])
         records[0].source.ready_event.synchronize.assert_not_called()
         records[0].source.ready_event.query.return_value = True
-        self.assertFalse(manager.submit_batches(executor, MagicMock(), MagicMock(), max_batch_bytes=1024))
+        self.assertFalse(manager.submit_batches(executor, MagicMock(), max_batch_bytes=1024))
         self.assertEqual(executor.submit.call_args.args[1], [records[0]])
         self.assertTrue(wake.is_set())
 
@@ -105,9 +107,12 @@ class TestProducerDispatch(unittest.TestCase):
         manager, _ = self._manager()
         records = []
         for name, size, consumer in (
-            ("a", 257, "pd1"), ("b", 1, "pd1"),
-            ("other", 256, "pd2"), ("large", 1025, "pd1"),
-            ("c", 256, "pd1"), ("d", 256, "pd1"),
+            ("a", 257, "pd1"),
+            ("b", 1, "pd1"),
+            ("other", 256, "pd2"),
+            ("large", 1025, "pd1"),
+            ("c", 256, "pd1"),
+            ("d", 256, "pd1"),
         ):
             spec = _spec(name, consumer)
             spec.nbytes = size
@@ -118,20 +123,18 @@ class TestProducerDispatch(unittest.TestCase):
             records.append(record)
         executor = MagicMock()
         executor.submit.side_effect = lambda *_: Future()
-        on_submit = MagicMock()
-        manager.submit_batches(executor, MagicMock(), on_submit, max_batch_bytes=512)
+        manager.submit_batches(executor, MagicMock(), max_batch_bytes=512)
         batches = [call.args[1] for call in executor.submit.call_args_list]
         self.assertEqual(
             [[record.spec.transfer_id for record in batch] for batch in batches],
             [["a"], ["b"], ["large"], ["c", "d"], ["other"]],
         )
-        self.assertEqual(on_submit.call_count, 5)
         for batch in batches:
             self.assertEqual(len({record.spec.consumer_zmq for record in batch}), 1)
             self.assertTrue(all(record.batch_future is batch[0].batch_future for record in batch))
         self.assertEqual(len({id(batch[0].batch_future) for batch in batches}), 5)
         self.assertEqual(set(manager._batch_ids), {record.spec.transfer_id for record in records})
-        manager.submit_batches(executor, MagicMock(), on_submit, max_batch_bytes=512)
+        manager.submit_batches(executor, MagicMock(), max_batch_bytes=512)
         self.assertEqual(executor.submit.call_count, 5)
 
     def test_dispatch_progresses_without_model_step_and_after_device_ready(self):
@@ -146,7 +149,6 @@ class TestProducerDispatch(unittest.TestCase):
         worker._producer_memory = SimpleNamespace(capacity=1024)
         worker._push_ready = wake
         worker._dispatch_stop = threading.Event()
-        worker._note_push_batch_queued = MagicMock()
         dispatched = threading.Event()
         worker._push_batch = lambda records: dispatched.set()
         self.module.torch.npu = SimpleNamespace(set_device=lambda _: None)
@@ -160,7 +162,6 @@ class TestProducerDispatch(unittest.TestCase):
                 self.assertFalse(dispatched.wait(0.02))
                 ready.set()
                 self.assertTrue(dispatched.wait(1))
-                worker._note_push_batch_queued.assert_called_once()
             finally:
                 worker._dispatch_stop.set()
                 wake.set()
@@ -171,7 +172,6 @@ class TestProducerDispatch(unittest.TestCase):
         worker = self.module.ECMooncakeWorker.__new__(self.module.ECMooncakeWorker)
         worker._control_client = MagicMock()
         worker._retry_cancel_reservations = MagicMock()
-        worker._timing_enabled = False
         manager, _ = self._manager()
         worker._producer_pushes = manager
         worker._producer_memory = SimpleNamespace(capacity=1024)
@@ -243,7 +243,6 @@ class TestProducerDispatch(unittest.TestCase):
         worker._consumer_memory = MagicMock()
         worker._producer_memory = MagicMock(capacity=1024)
         worker._transfer = MagicMock()
-        worker._note_push_batch_queued = MagicMock()
         worker._push_batch = MagicMock()
         worker._producer_pushes.bind_source("0", object(), None)
         with ThreadPoolExecutor(max_workers=1) as control, ThreadPoolExecutor(max_workers=1) as io:

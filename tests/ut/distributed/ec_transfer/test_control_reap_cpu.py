@@ -19,8 +19,10 @@ def load_control():
         node
         for node in tree.body
         if not (
-            isinstance(node, ast.ImportFrom) and node.module == "vllm.logger"
-            or isinstance(node, ast.Import) and any(alias.name == "torch" for alias in node.names)
+            isinstance(node, ast.ImportFrom)
+            and node.module == "vllm.logger"
+            or isinstance(node, ast.Import)
+            and any(alias.name == "torch" for alias in node.names)
         )
     ]
     module = types.ModuleType("control_reap_cpu")
@@ -50,8 +52,13 @@ class TestControlReap(unittest.TestCase):
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
         server = control.ConsumerControlServer(
-            "127.0.0.1", port, reserve, lambda _: {"ready": True},
-            lambda *_: None, lambda *_: False, reap, 0,
+            "127.0.0.1",
+            port,
+            reserve,
+            lambda _: {"ready": True},
+            lambda *_: None,
+            lambda *_: False,
+            reap,
         )
         client = control.ControlClient(1000)
         inbox = control.EventInbox(client)
@@ -59,15 +66,21 @@ class TestControlReap(unittest.TestCase):
         try:
             server.start()
             inbox._connect(addr)
-            result = client.request(addr, {
-                "op": "reserve_batch",
-                "items": [{"transfer_id": value} for value in ("first", "failed", "last")],
-            })
-            self.assertEqual(result["items"], [
-                {"ok": True, "result": {"ready": True}},
-                {"ok": False, "error": "full"},
-                {"ok": True, "result": {"ready": True}},
-            ])
+            result = client.request(
+                addr,
+                {
+                    "op": "reserve_batch",
+                    "items": [{"transfer_id": value} for value in ("first", "failed", "last")],
+                },
+            )
+            self.assertEqual(
+                result["items"],
+                [
+                    {"ok": True, "result": {"ready": True}},
+                    {"ok": False, "error": "full"},
+                    {"ok": True, "result": {"ready": True}},
+                ],
+            )
             self.assertEqual(calls, ["reap", "first", "failed", "last"])
             self.assertEqual(client.request(addr, {"op": "reserve", "transfer_id": "single"}), {"ready": True})
             self.assertEqual(calls, ["reap", "first", "failed", "last", "reap", "single"])

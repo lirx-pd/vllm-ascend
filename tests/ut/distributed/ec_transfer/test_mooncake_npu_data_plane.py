@@ -12,7 +12,6 @@ import sys
 import time
 import types
 import unittest
-from collections import Counter
 from concurrent.futures import Future
 from enum import Enum
 from pathlib import Path
@@ -257,11 +256,9 @@ class TestMooncakeNPUDataPlane(unittest.TestCase):
         scheduler._is_producer = False
         scheduler._is_consumer = True
         scheduler._transfers = self.state_module.SchedulerTransferTable(1_000_000, 300.0)
-        scheduler._consumer_scheduler_metrics = Counter()
         scheduler._scheduler_pending_work = False
         scheduler._drain_push_notifications = MagicMock()
         scheduler._note_awaiting_push = MagicMock()
-        scheduler._maybe_log_consumer_scheduler_metrics = MagicMock()
         return scheduler
 
     def _push_spec(self, transfer_id):
@@ -291,7 +288,7 @@ class TestMooncakeNPUDataPlane(unittest.TestCase):
         executor = MagicMock()
         executor.submit.return_value = Future()
         run_batch = MagicMock()
-        manager.submit_batches(executor, run_batch, MagicMock(), max_batch_bytes=1024)
+        manager.submit_batches(executor, run_batch, max_batch_bytes=1024)
 
         executor.submit.assert_called_once_with(run_batch, [records["healthy"]])
         self.assertIs(records["failed"].state, self.producer_module.ProducerPushState.FAILED)
@@ -329,7 +326,7 @@ class TestMooncakeNPUDataPlane(unittest.TestCase):
             port = probe.getsockname()[1]
         control = self.control_module
         server = control.ConsumerControlServer(
-            "127.0.0.1", port, MagicMock(), MagicMock(), MagicMock(), MagicMock(return_value=True), lambda: 0, 0
+            "127.0.0.1", port, MagicMock(), MagicMock(), MagicMock(), MagicMock(return_value=True), lambda: 0
         )
         client = control.ControlClient(1000)
         inbox = control.EventInbox(client)
@@ -386,7 +383,6 @@ class TestMooncakeNPUDataPlane(unittest.TestCase):
             MagicMock(),
             MagicMock(),
             lambda: 0,
-            0,
             drain_events=lambda: drained.pop(0) if drained else [],
         )
         client = control.ControlClient(1000)

@@ -28,6 +28,7 @@ logger = init_logger(__name__)
 
 _T = TypeVar("_T")
 _REGISTRATION_ALIGNMENT = 2 * 1024 * 1024
+STAGING_ALIGNMENT = 256
 
 
 @dataclass
@@ -90,7 +91,7 @@ class ContiguousAllocator:
         _free: Sorted free ranges represented as ``(offset, size)`` pairs.
     """
 
-    def __init__(self, capacity: int, alignment: int = 256):
+    def __init__(self, capacity: int, alignment: int = STAGING_ALIGNMENT):
         self.capacity = capacity
         self.alignment = alignment
         self._free = [(0, capacity)]
@@ -287,6 +288,10 @@ class ProducerMemoryPool:
     @property
     def tensor(self) -> torch.Tensor | None:
         return self._pool
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
 
     def _ensure_pool(self, device: torch.device) -> None:
         if self._pool is not None:

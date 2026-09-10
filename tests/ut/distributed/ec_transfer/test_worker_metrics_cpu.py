@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,7 +40,7 @@ class TestResidentMetrics(unittest.TestCase):
             torch=SimpleNamespace(npu=npu),
             partial=partial,
             Any=object,
-            _PUSH_STAGES=("reserve", "device", "register", "transfer", "unregister", "complete"),
+            _PUSH_STAGES=("reserve", "device", "admission", "register", "transfer", "unregister", "complete"),
             _RESERVATION_REFRESH_SECONDS=150,
         )
         exec(compile(tree, str(path), "exec"), namespace)
@@ -73,6 +74,7 @@ class TestResidentMetrics(unittest.TestCase):
         worker = worker_class()
         worker._device = SimpleNamespace(index=3)
         worker._push_perf_lock = threading.Lock()
+        worker._staging_lock = threading.Lock()
         worker._queued_transfer_batches = 1
         worker._active_transfer_batches = 0
         worker._producer_pushes = Mock()
@@ -100,8 +102,8 @@ class TestResidentMetrics(unittest.TestCase):
         with self.assertLogs(logger, level="INFO") as captured:
             worker._push_batch(pushes)
         payloads = [json.loads(line.split("NPU_EPD_TIMING ", 1)[1]) for line in captured.output]
-        self.assertEqual(len(payloads), 9)
-        self.assertEqual(len({payload["stage"] for payload in payloads}), 8)
+        self.assertEqual(len(payloads), 10)
+        self.assertEqual(len({payload["stage"] for payload in payloads}), 9)
         batches = [payload for payload in payloads if payload["scope"] == "batch"]
         self.assertTrue(all(payload["transfer_ids"] == ["transfer-0", "transfer-1"] for payload in batches))
         queues = [payload for payload in payloads if payload["scope"] == "item"]
@@ -112,6 +114,78 @@ class TestResidentMetrics(unittest.TestCase):
             self.assertNotIn("request_ids", payload)
             self.assertNotIn("transfer_ids", payload)
             self.assertNotIn("mm_hashes", payload)
+
+    def test_concurrent_batches_share_slab_and_release_after_write_failure(self):
+        worker_class, logger = self._timing_worker_class(npu=Mock())
+        worker = worker_class()
+        worker._timing_enabled = False
+        worker._push_perf_lock = threading.Lock()
+        worker._staging_lock = threading.Lock()
+        worker._queued_transfer_batches = 2
+        worker._active_transfer_batches = 0
+        worker._producer_pushes = Mock()
+        worker._producer_pushes.resolve_reservations.return_value = [
+            {"nbytes": 4, "dst_session": "consumer", "dst_ptr": 123}
+        ]
+        second_started = threading.Event()
+        first_writing = threading.Event()
+        allow_failure = threading.Event()
+        second_staged = threading.Event()
+        batches = [
+            [SimpleNamespace(
+                source_at=time.monotonic(),
+                source=SimpleNamespace(tensor=Mock(nbytes=4, device="npu:0"), ready_event=None),
+                spec=SimpleNamespace(transfer_id=str(index), mm_hash=str(index), nbytes=4),
+            )]
+            for index in range(2)
+        ]
+        worker._validate_push_source = lambda push: second_started.set() if push is batches[1][0] else None
+        allocations = []
+        order = []
+
+        def stage(tensors):
+            self.assertFalse(allocations)
+            staged = SimpleNamespace(tensors=tensors)
+            allocations.append(staged)
+            order.append("stage")
+            if tensors[0] is batches[1][0].source.tensor:
+                second_staged.set()
+            return staged
+
+        def release(staged):
+            self.assertIs(allocations.pop(), staged)
+            order.append("release")
+
+        def write(*_):
+            if not first_writing.is_set():
+                first_writing.set()
+                if not allow_failure.wait(2):
+                    raise TimeoutError("test did not release first writer")
+                raise RuntimeError("write failed")
+
+        worker._producer_memory = Mock(stage=stage, release=release)
+        worker._transfer = Mock(write=write)
+        worker._run_fanout = lambda calls, track: [call() for call in calls]
+        worker._notify_completions = Mock()
+        worker._abandon_pushes = Mock()
+        worker._record_push_perf = Mock()
+        with self.assertLogs(logger, level="ERROR"), ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(worker._push_batch, batches[0])
+            try:
+                self.assertTrue(first_writing.wait(1))
+                second = executor.submit(worker._push_batch, batches[1])
+                self.assertTrue(second_started.wait(1))
+                self.assertFalse(second_staged.wait(0.05))
+            finally:
+                allow_failure.set()
+            first.result(timeout=2)
+            second.result(timeout=2)
+        self.assertEqual(order, ["stage", "release", "stage", "release"])
+        self.assertFalse(allocations)
+        worker._producer_pushes.fail.assert_called_once()
+        self.assertIs(worker._producer_pushes.fail.call_args.args[0], batches[0])
+        worker._producer_pushes.complete.assert_called_once_with(batches[1])
+        worker._abandon_pushes.assert_called_once_with(batches[0])
 
     def test_push_phase_durations_and_item_queues(self):
         clock = SimpleNamespace(now=10.0)
@@ -129,6 +203,7 @@ class TestResidentMetrics(unittest.TestCase):
         worker._device = SimpleNamespace(index=0)
         worker._timing_enabled = True
         worker._push_perf_lock = threading.Lock()
+        worker._staging_lock = threading.Lock()
         worker._queued_transfer_batches = 1
         worker._active_transfer_batches = 0
         worker._validate_push_source = Mock()
@@ -177,6 +252,7 @@ class TestResidentMetrics(unittest.TestCase):
         expected = {
             "producer_reservation_wait_completed": 0.2,
             "producer_device_ready_completed": 0.4,
+            "producer_staging_wait_completed": 0.0,
             "producer_staging_copy_completed": 0.7,
             "producer_staging_completed": 1.1,
             "producer_transfer_completed": 0.5,

@@ -23,6 +23,7 @@ def _load_classes():
     module = types.ModuleType(name)
     sys.modules[name] = module
     module.torch = SimpleNamespace(Tensor=object)
+    module.STAGING_ALIGNMENT = 256
     tree = ast.parse((_MOONCAKE / "producer.py").read_text())
     tree.body = [
         node
@@ -92,13 +93,46 @@ class TestProducerDispatch(unittest.TestCase):
             manager.bind_source(name, object(), event)
             records.append(record)
         executor = MagicMock()
-        self.assertTrue(manager.submit_batches(executor, MagicMock(), MagicMock()))
+        self.assertTrue(manager.submit_batches(executor, MagicMock(), MagicMock(), max_batch_bytes=1024))
         self.assertEqual(executor.submit.call_args.args[1], [records[1]])
         records[0].source.ready_event.synchronize.assert_not_called()
         records[0].source.ready_event.query.return_value = True
-        self.assertFalse(manager.submit_batches(executor, MagicMock(), MagicMock()))
+        self.assertFalse(manager.submit_batches(executor, MagicMock(), MagicMock(), max_batch_bytes=1024))
         self.assertEqual(executor.submit.call_args.args[1], [records[0]])
         self.assertTrue(wake.is_set())
+
+    def test_batches_obey_aligned_capacity_and_isolate_oversized_sources(self):
+        manager, _ = self._manager()
+        records = []
+        for name, size, consumer in (
+            ("a", 257, "pd1"), ("b", 1, "pd1"),
+            ("other", 256, "pd2"), ("large", 1025, "pd1"),
+            ("c", 256, "pd1"), ("d", 256, "pd1"),
+        ):
+            spec = _spec(name, consumer)
+            spec.nbytes = size
+            future = Future()
+            future.set_result([{}])
+            record, _ = manager.reserve(spec, lambda future=future: future)
+            manager.bind_source(name, object(), None)
+            records.append(record)
+        executor = MagicMock()
+        executor.submit.side_effect = lambda *_: Future()
+        on_submit = MagicMock()
+        manager.submit_batches(executor, MagicMock(), on_submit, max_batch_bytes=512)
+        batches = [call.args[1] for call in executor.submit.call_args_list]
+        self.assertEqual(
+            [[record.spec.transfer_id for record in batch] for batch in batches],
+            [["a"], ["b"], ["large"], ["c", "d"], ["other"]],
+        )
+        self.assertEqual(on_submit.call_count, 5)
+        for batch in batches:
+            self.assertEqual(len({record.spec.consumer_zmq for record in batch}), 1)
+            self.assertTrue(all(record.batch_future is batch[0].batch_future for record in batch))
+        self.assertEqual(len({id(batch[0].batch_future) for batch in batches}), 5)
+        self.assertEqual(set(manager._batch_ids), {record.spec.transfer_id for record in records})
+        manager.submit_batches(executor, MagicMock(), on_submit, max_batch_bytes=512)
+        self.assertEqual(executor.submit.call_count, 5)
 
     def test_dispatch_progresses_without_model_step_and_after_device_ready(self):
         manager, wake = self._manager()
@@ -109,6 +143,7 @@ class TestProducerDispatch(unittest.TestCase):
         worker = self.module.ECMooncakeWorker.__new__(self.module.ECMooncakeWorker)
         worker._device = "npu:0"
         worker._producer_pushes = manager
+        worker._producer_memory = SimpleNamespace(capacity=1024)
         worker._push_ready = wake
         worker._dispatch_stop = threading.Event()
         worker._note_push_batch_queued = MagicMock()
@@ -139,6 +174,7 @@ class TestProducerDispatch(unittest.TestCase):
         worker._timing_enabled = False
         manager, _ = self._manager()
         worker._producer_pushes = manager
+        worker._producer_memory = SimpleNamespace(capacity=1024)
         return worker, [manager.reserve(_spec(str(index)), Future)[0] for index in range(3)]
 
     def test_batch_partial_failure_settles_each_future_and_only_cancels_failure(self):
@@ -205,7 +241,7 @@ class TestProducerDispatch(unittest.TestCase):
         worker._fanout_pool = None
         worker._control_server = None
         worker._consumer_memory = MagicMock()
-        worker._producer_memory = MagicMock()
+        worker._producer_memory = MagicMock(capacity=1024)
         worker._transfer = MagicMock()
         worker._note_push_batch_queued = MagicMock()
         worker._push_batch = MagicMock()

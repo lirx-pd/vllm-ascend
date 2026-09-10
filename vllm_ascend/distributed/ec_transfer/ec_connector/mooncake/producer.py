@@ -20,6 +20,7 @@ from typing import Any
 
 import torch
 
+from vllm_ascend.distributed.ec_transfer.ec_connector.mooncake.memory import STAGING_ALIGNMENT
 from vllm_ascend.distributed.ec_transfer.ec_connector.mooncake.metadata import (
     ECMooncakePushSpec,
 )
@@ -186,6 +187,7 @@ class ProducerPushManager:
         run_batch: Callable[[list[ProducerPushRecord]], None],
         on_submit: Callable[[], None],
         *,
+        max_batch_bytes: int,
         wait: bool = False,
     ) -> bool:
         pending_event = False
@@ -206,7 +208,25 @@ class ProducerPushManager:
                         pending_event = True
                         continue
                     grouped.setdefault(record.spec.consumer_zmq, []).append(record)
-            batches = list(grouped.values())
+            batches: list[list[ProducerPushRecord]] = []
+            for group in grouped.values():
+                batch: list[ProducerPushRecord] = []
+                batch_bytes = 0
+                for record in group:
+                    nbytes = (record.spec.nbytes + STAGING_ALIGNMENT - 1) // STAGING_ALIGNMENT * STAGING_ALIGNMENT
+                    if batch and batch_bytes + nbytes > max_batch_bytes:
+                        batches.append(batch)
+                        batch = []
+                        batch_bytes = 0
+                    batch.append(record)
+                    batch_bytes += nbytes
+                    # An oversized source fails alone without poisoning its peers.
+                    if batch_bytes >= max_batch_bytes:
+                        batches.append(batch)
+                        batch = []
+                        batch_bytes = 0
+                if batch:
+                    batches.append(batch)
             for records in batches:
                 on_submit()
                 future = executor.submit(run_batch, records)

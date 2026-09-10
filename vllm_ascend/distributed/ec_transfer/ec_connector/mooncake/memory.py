@@ -393,9 +393,9 @@ class ConsumerMemoryPool:
     ) -> None:
         if not receiving_rank:
             return
-        if self._pool is not None or device.type != "npu":
-            if device.type != "npu":
-                raise ValueError("Mooncake EC consumer pool requires an NPU device.")
+        if device.type != "npu":
+            raise ValueError("Mooncake EC consumer pool requires an NPU device.")
+        if self._pool is not None:
             return
         try:
             pool = _allocate_registered_pool(self._capacity, device)

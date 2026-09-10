@@ -76,7 +76,6 @@ class ECMooncakeScheduler:
         _control_client: Client for reservation status and cancellation.
         _event_inbox: Non-blocking source of Consumer readiness events.
         _control_executor: Executor for cancellation requests.
-        _metadata_fields_cache: Placeholder metadata fields by modality.
         _drain_pending: Whether the next scheduling pass should drain events.
         _drained_at: Time of the most recent readiness-event drain.
         _pending_cancels: Asynchronous cancellations by transfer ID.
@@ -127,7 +126,6 @@ class ECMooncakeScheduler:
         self._event_inbox = event_inbox
         self._control_executor = control_executor
 
-        self._metadata_fields_cache: dict[str, set[str]] = {}
         self._drain_pending = True
         self._drained_at = 0.0
         self._pending_cancels: dict[str, Future[Any]] = {}
@@ -425,14 +423,6 @@ class ECMooncakeScheduler:
     def has_pending_push_work(self) -> bool:
         return self._scheduler_pending_work
 
-    def _placeholder_metadata_fields(self, modality: str) -> set[str]:
-        if modality in self._metadata_fields_cache:
-            return self._metadata_fields_cache[modality]
-
-        fields = set(_QWEN_VL_PLACEHOLDER_METADATA_FIELDS.get(modality, ()))
-        self._metadata_fields_cache[modality] = fields
-        return fields
-
     def request_finished(self, request: Any) -> tuple[bool, dict[str, Any] | None]:
         if self._is_consumer:
             for index in range(len(request.mm_features)):
@@ -457,7 +447,7 @@ class ECMooncakeScheduler:
         for index, feature in enumerate(request.mm_features):
             metadata = {}
             if feature.data is not None:
-                wanted = self._placeholder_metadata_fields(feature.modality)
+                wanted = _QWEN_VL_PLACEHOLDER_METADATA_FIELDS.get(feature.modality, ())
                 metadata = {
                     key: value.tolist()
                     for key, value in feature.data.get_data().items()

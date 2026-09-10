@@ -252,8 +252,6 @@ async def fanout_encoder_primer(
     logger.info("[%s] got %d multimodal items...", req_id, len(mm_items))
 
     tasks = []
-    item_uuids: dict[int, str] = {}
-    item_transfer_ids: dict[int, str] = {}
     item_meta: dict[int, dict] = {}
 
     # Rotate the first encoder per request, then round-robin its media items.
@@ -271,10 +269,9 @@ async def fanout_encoder_primer(
         # a uuid here would make the two disagree and silently defeat the EC
         # transfer, leaving the decoder to encode the image itself.
         item_uuid = None if NO_REWRITE else content_uuid(item)
-        if item_uuid is not None:
-            item_uuids[idx] = item_uuid
         transfer_id = uuid.uuid4().hex
-        item_transfer_ids[idx] = transfer_id
+        if item_uuid is not None:
+            item_meta[idx] = {"mm_hash": item_uuid, "transfer_id": transfer_id}
 
         encoder_req = {
             # You *may* need to keep additional fields
@@ -328,13 +325,9 @@ async def fanout_encoder_primer(
                 )
 
             response_data = json.loads(await r.read())
-            if idx in item_uuids:
-                item_meta[idx] = {
-                    "mm_hash": item_uuids[idx],
-                    "transfer_id": item_transfer_ids[idx],
-                }
+            if idx in item_meta:
                 for reported in (response_data.get("ec_transfer_params") or {}).get("ec_items", []):
-                    if reported.get("mm_hash") == item_uuids[idx] and "image_grid_thw" in reported:
+                    if reported.get("mm_hash") == item_meta[idx]["mm_hash"] and "image_grid_thw" in reported:
                         item_meta[idx]["image_grid_thw"] = reported["image_grid_thw"]
                         break
     finally:

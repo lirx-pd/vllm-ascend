@@ -411,13 +411,12 @@ class ConsumerReservationManager:
                 self._terminate(record, ConsumerReservationState.EXPIRED)
                 expired += 1
             elif record.state is ConsumerReservationState.WRITING:
+                self._transition(record, ConsumerReservationState.EXPIRE_PENDING)
                 if record.writer_id:
-                    self._transition(record, ConsumerReservationState.EXPIRE_PENDING)
                     self._terminate(record, ConsumerReservationState.EXPIRED)
                     self._events.append(self._failed_event(record, "reservation expired"))
                     expired += 1
                 else:
-                    self._transition(record, ConsumerReservationState.EXPIRE_PENDING)
                     deferred += 1
         dropped = self._reap_tombstones(now)
         return expired, deferred, dropped

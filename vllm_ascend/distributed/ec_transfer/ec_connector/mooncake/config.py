@@ -35,16 +35,15 @@ def _positive_integer(name: str, value: object) -> int:
     return parsed
 
 
-def _finite_float(name: str, value: object, allow_zero: bool) -> float:
-    requirement = ">= 0" if allow_zero else "> 0"
-    message = f"ECMooncakeConnector requires {name} {requirement}."
+def _finite_float(name: str, value: object) -> float:
+    message = f"ECMooncakeConnector requires {name} > 0."
     if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         raise ValueError(message)
     try:
         parsed = float(value)
     except ValueError as error:
         raise ValueError(message) from error
-    if not math.isfinite(parsed) or parsed < 0 or (parsed == 0 and not allow_zero):
+    if not math.isfinite(parsed) or parsed <= 0:
         raise ValueError(message)
     return parsed
 
@@ -148,10 +147,10 @@ class MooncakeECConfig:
         if is_consumer and role == ECConnectorRole.WORKER and reservation_port is None:
             raise ValueError("ec_consumer with ECMooncakeConnector workers require reservation_zmq_port.")
 
-        control_timeout_s = _finite_float("control_timeout_s", extra.get("control_timeout_s", 30), False)
+        control_timeout_s = _finite_float("control_timeout_s", extra.get("control_timeout_s", 30))
         if control_timeout_s > (2**31 - 1) / 1000:
             raise ValueError("ECMooncakeConnector control_timeout_s is too large.")
-        push_wait_timeout_s = _finite_float("push_wait_timeout_s", extra.get("push_wait_timeout_s", 60), False)
+        push_wait_timeout_s = _finite_float("push_wait_timeout_s", extra.get("push_wait_timeout_s", 60))
         transfer_workers = _positive_integer("transfer_max_workers", extra.get("transfer_max_workers", 4))
         control_workers = _positive_integer("control_max_workers", extra.get("control_max_workers", 8))
         producer_pool_size = _positive_integer(

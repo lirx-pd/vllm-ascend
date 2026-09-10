@@ -311,24 +311,19 @@ class ConsumerControlServer:
             context = zmq.Context()
             socket = context.socket(zmq.REP)
             event_socket = context.socket(zmq.PUSH)
-            pending_events: deque[dict[str, Any]] = deque()
-
-            def queue_event(event: dict[str, Any]) -> None:
-                if len(pending_events) >= _MAX_PENDING_EVENTS:
-                    pending_events.popleft()
-                pending_events.append(event)
+            pending_events: deque[dict[str, Any]] = deque(maxlen=_MAX_PENDING_EVENTS)
 
             def queue_drained_events() -> None:
                 try:
                     for event in self._drain_events():
-                        queue_event(event)
+                        pending_events.append(event)
                 except Exception:
                     logger.exception("EC Mooncake could not drain reservation events")
 
             def queue_ready(transfer_id: str) -> None:
                 status = self._status(transfer_id)
                 if status is not None:
-                    queue_event({"transfer_id": transfer_id, **status})
+                    pending_events.append({"transfer_id": transfer_id, **status})
 
             last_reap_at = time.monotonic()
             socket.setsockopt(zmq.RCVTIMEO, 100)
@@ -399,11 +394,8 @@ class ConsumerControlServer:
                                         "became_ready": completion.became_ready,
                                     }
                                 )
-                                if not completion.became_ready:
-                                    continue
-                                status = self._status(transfer_id)
-                                if status is not None:
-                                    queue_event({"transfer_id": transfer_id, **status})
+                                if completion.became_ready:
+                                    queue_ready(transfer_id)
                             result = {"items": completions} if op == "complete_batch" else completions[0]
                         elif op == "cancel":
                             result = {
@@ -420,7 +412,7 @@ class ConsumerControlServer:
                                 and not request.get("refresh")
                                 and request.get("mm_hash")
                             ):
-                                queue_event(
+                                pending_events.append(
                                     {
                                         "transfer_id": str(request["transfer_id"]),
                                         "mm_hash": str(request["mm_hash"]),

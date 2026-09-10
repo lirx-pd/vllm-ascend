@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import logging
+import os
 import socket
 import sys
 import time
@@ -172,6 +173,7 @@ class TestMooncakeNPUDataPlane(unittest.TestCase):
         cls.memory_module = _load("ec_mooncake_test_memory", "memory.py")
 
         prefix = "vllm_ascend.distributed.ec_transfer.ec_connector.mooncake"
+        sys.modules[f"{prefix}.memory"] = cls.memory_module
         cls.metadata_module = _load(f"{prefix}.metadata", "metadata.py")
         cls.state_module = _load(f"{prefix}.state", "state.py")
         sys.modules[f"{prefix}.config"] = cls.config_module
@@ -289,7 +291,7 @@ class TestMooncakeNPUDataPlane(unittest.TestCase):
         executor = MagicMock()
         executor.submit.return_value = Future()
         run_batch = MagicMock()
-        manager.submit_batches(executor, run_batch, MagicMock())
+        manager.submit_batches(executor, run_batch, MagicMock(), max_batch_bytes=1024)
 
         executor.submit.assert_called_once_with(run_batch, [records["healthy"]])
         self.assertIs(records["failed"].state, self.producer_module.ProducerPushState.FAILED)
@@ -497,7 +499,7 @@ class TestMooncakeNPUDataPlane(unittest.TestCase):
         window = MagicMock(return_value=(0, 1))
         namespace = {"get_mm_features_in_window": window, "SchedulerInterface": object}
         sources = (
-            (_ROOT.parent / "vllm/vllm/v1/core/sched/scheduler.py", "Scheduler"),
+            (Path(os.environ.get("VLLM_PATH", _ROOT.parent / "vllm")) / "vllm/v1/core/sched/scheduler.py", "Scheduler"),
             (_ROOT / "vllm_ascend/patch/platform/patch_balance_schedule.py", "BalanceScheduler"),
         )
         for path, name in sources:

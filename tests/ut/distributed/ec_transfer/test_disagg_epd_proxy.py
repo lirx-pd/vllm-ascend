@@ -22,6 +22,84 @@ _spec.loader.exec_module(proxy)
 
 
 class ProxyIdentityTest(unittest.IsolatedAsyncioTestCase):
+    def test_fixed_item_positions_rotate_across_all_encoders(self):
+        for encoder_count in (1, 2, 3, 4):
+            encoders = [f"http://e{i}" for i in range(encoder_count)]
+            for item_count in (1, 2, 3, 4, 6):
+                with self.subTest(encoders=encoder_count, items=item_count):
+                    cursor = 0
+                    assignments = []
+                    for _ in encoders:
+                        urls, cursor = proxy.encoder_rr_assignment(encoders, cursor, item_count)
+                        assignments.append(urls)
+                    for item_index in range(item_count):
+                        self.assertCountEqual([urls[item_index] for urls in assignments], encoders)
+                    self.assertEqual(cursor, 0)
+            self.assertEqual(proxy.encoder_rr_assignment(encoders, encoder_count - 1, 0), ([], encoder_count - 1))
+
+    async def test_concurrent_four_image_requests_balance_large_image_over_http(self):
+        images = [{"type": "image_url", "image_url": {"url": f"image-{i}.png"}, "uuid": f"image-{i}"} for i in range(4)]
+        request = {"messages": [{"content": images}]}
+        received = {}
+
+        async def encode(http_request):
+            body = await http_request.json()
+            parent, item, _ = http_request.headers["x-request-id"].split(":")
+            received[parent, int(item)] = http_request.host
+            self.assertEqual(body["messages"][0]["content"][0], images[int(item)])
+            self.assertEqual(body["ec_transfer_params"]["consumer_zmq"], "tcp://consumer")
+            return web.json_response({})
+
+        upstream0, upstream1 = web.Application(), web.Application()
+        for upstream in (upstream0, upstream1):
+            upstream.router.add_post("/v1/chat/completions", encode)
+        async with (
+            TestServer(upstream0) as server0,
+            TestServer(upstream1) as server1,
+            proxy.aiohttp.ClientSession() as session,
+        ):
+            encoders = [str(server.make_url("/")).rstrip("/") for server in (server0, server1)]
+            hosts = [f"{server.host}:{server.port}" for server in (server0, server1)]
+            with (
+                patch.object(proxy, "encode_session", session),
+                patch.object(proxy, "NO_REWRITE", False),
+                patch.object(proxy, "encoder_rr_idx", 0),
+            ):
+                results = await asyncio.gather(
+                    *(proxy.fanout_encoder_primer(request, encoders, str(i), "tcp://consumer") for i in range(32))
+                )
+        self.assertEqual(len(received), 128)
+        for host in hosts:
+            self.assertEqual(sum(target == host for (parent, item), target in received.items() if item == 0), 16)
+            self.assertEqual(sum(target == host for target in received.values()), 64)
+        for metadata in results:
+            self.assertEqual([metadata[i]["mm_hash"] for i in range(4)], [image["uuid"] for image in images])
+
+    async def test_explicit_image_uuid_reaches_encoder_and_consumer(self):
+        images = [
+            {"type": "image_url", "image_url": {"url": "same.png"}, "uuid": identity}
+            for identity in ("image-first", "image-second")
+        ]
+        request = {"messages": [{"content": images}]}
+        response = MagicMock(status=200)
+        response.read = AsyncMock(return_value=b"{}")
+        session = AsyncMock()
+        session.post.return_value = response
+        with patch.object(proxy, "encode_session", session), patch.object(proxy, "NO_REWRITE", False):
+            metadata = await proxy.fanout_encoder_primer(request, ["http://encoder"], "request", "tcp://consumer")
+            forwarded = proxy.rewrite_for_decode(request, metadata)
+        for index, call in enumerate(session.post.call_args_list):
+            identity = images[index]["uuid"]
+            encoded = call.kwargs["json"]
+            self.assertEqual(encoded["messages"][0]["content"][0]["uuid"], identity)
+            self.assertEqual(encoded["ec_transfer_params"]["ec_items"][0]["mm_hash"], identity)
+            self.assertEqual(forwarded["messages"][0]["content"][index]["uuid"], identity)
+            self.assertEqual(forwarded["ec_transfer_params"]["ec_items"][index]["mm_hash"], identity)
+        self.assertEqual(
+            proxy.content_uuid({**images[0], "uuid": None}),
+            proxy.content_uuid({"type": "image_url", "image_url": {"url": "same.png"}}),
+        )
+
     async def test_per_image_round_robin_and_metadata_only_decode(self):
         image = {"type": "image_url", "image_url": {"url": "test.png"}}
         request = {"messages": [{"content": [image, image, image]}]}

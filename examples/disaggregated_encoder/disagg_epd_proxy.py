@@ -68,12 +68,11 @@ MM_TYPES = {"image_url", "audio_url", "input_audio", "video_url"}
 def encoder_rr_assignment(e_urls: list[str], start: int, count: int) -> tuple[list[str], int]:
     """Assign `count` items to encoder URLs starting from cursor `start`.
 
-    Returns the per-item URL list and the cursor value the next call should
-    start from, so the assignment is contiguous across calls instead of
-    restarting at e_urls[0] every time.
+    Rotate the starting encoder once per nonempty request so fixed item
+    positions do not stay on the same encoder when counts share a divisor.
     """
     urls = [e_urls[(start + i) % len(e_urls)] for i in range(count)]
-    next_start = (start + count) % len(e_urls)
+    next_start = (start + 1) % len(e_urls) if count else start
     return urls, next_start
 
 
@@ -143,14 +142,9 @@ async def encoder_post(target_url: str, encoder_req: dict, headers: dict, parent
 
 
 def content_uuid(item: dict) -> str:
-    """Cache key for a multimodal item, derived from its content.
-
-    Must be content-derived, not request-derived: the EC cache is keyed by this
-    value, so a per-request key (a request id, say) would make every request a
-    miss and throw away cross-request reuse of already-encoded media -- while
-    the unmodified path, which hashes the content, would keep it. That asymmetry
-    silently biases any comparison between the two.
-    """
+    """Preserve explicit media identity; otherwise reuse content-derived keys."""
+    if item.get("uuid") is not None:
+        return str(item["uuid"])
     url = (item.get("image_url") or item.get("audio_url") or item.get("video_url") or {}).get("url") or ""
     payload = url or json.dumps(item, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
@@ -262,9 +256,7 @@ async def fanout_encoder_primer(
     item_transfer_ids: dict[int, str] = {}
     item_meta: dict[int, dict] = {}
 
-    # Round-robin over encode servers to distribute load a bit. The cursor
-    # persists across requests so fan-out doesn't restart at e_urls[0] every
-    # time (which would hot-spot the first encoder for single-item requests).
+    # Rotate the first encoder per request, then round-robin its media items.
     global encoder_rr_idx
     async with encoder_rr_lock:
         url_cycle, encoder_rr_idx = encoder_rr_assignment(e_urls, encoder_rr_idx, len(mm_items))

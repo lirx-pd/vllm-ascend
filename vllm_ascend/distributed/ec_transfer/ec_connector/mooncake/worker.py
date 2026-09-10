@@ -75,6 +75,7 @@ _READY_EVENT_POLL_SECONDS = 0.001
 _PUSH_STAGES = (
     "reserve",
     "device",
+    "admission",
     "register",
     "transfer",
     "unregister",
@@ -141,6 +142,7 @@ class ECMooncakeWorker:
         _consumer_metrics_log_interval: Consumer metrics log interval.
         _consumer_metrics_started_at: Start time of the Consumer metric window.
         _producer_memory: Registered Producer source staging slab.
+        _staging_lock: Exclusive slab ownership through transfer completion.
         _transfer_metrics_log_interval: Producer performance log interval.
         _control_client: Client for remote Consumer control operations.
         _producer_metrics: Producer lifecycle metric counters.
@@ -203,6 +205,7 @@ class ECMooncakeWorker:
             config.producer_pool_size,
             self._transfer,
         )
+        self._staging_lock = threading.Lock()
         self._transfer_metrics_log_interval = config.transfer_metrics_log_interval
         self._timing_enabled = config.timing_enabled
         self._control_client = control_client
@@ -362,7 +365,6 @@ class ECMooncakeWorker:
         if expected_nbytes != nbytes:
             raise ValueError("shape and dtype do not match nbytes")
 
-        self._expire_push_reservations()
         reservation, should_write, reused, expiry_counts = self._reservations.reserve(
             transfer_id, mm_hash, nbytes, shape, dtype_name, dtype
         )
@@ -862,52 +864,59 @@ class ECMooncakeWorker:
                 tensors = [push.source.tensor for push in written_pushes.values() if push.source]
                 lengths = [tensor.nbytes for tensor in tensors]
                 stage_started_at = time.monotonic()
-                try:
-                    staged = self._producer_memory.stage(tensors)
-                    if staged is None:
-                        raise RuntimeError("Mooncake EC producer NPU staging pool is full")
-                    sources = staged.tensors
-                    # Mooncake reads outside the NPU stream.
-                    if sources:
-                        torch.npu.current_stream(sources[0].device).synchronize()
-                    addresses = [tensor.data_ptr() for tensor in sources]
-                finally:
-                    stage_ms["register"] = (time.monotonic() - stage_started_at) * 1000
-                try:
-                    by_session: dict[str, list[tuple[int, int]]] = {}
-                    session_records: dict[str, dict[str, ProducerPushRecord]] = {}
-                    for push, shard in ready:
-                        session = str(shard["dst_session"])
-                        by_session.setdefault(session, []).append(
-                            (source_index[push.spec.transfer_id], int(shard["dst_ptr"]))
-                        )
-                        session_records.setdefault(session, {})[push.spec.transfer_id] = push
-                    stage_started_at = time.monotonic()
-
-                    def write(session: str, items: list[tuple[int, int]]) -> None:
-                        self._transfer.write(
-                            session,
-                            [addresses[index] for index, _ in items],
-                            [dst for _, dst in items],
-                            [lengths[index] for index, _ in items],
-                        )
-
-                    sessions = list(by_session.items())
-
-                    # Write destinations concurrently to avoid serial transfer latency.
-                    def track_write(index: int, future: Future[None]) -> None:
-                        session = sessions[index][0]
-                        self._producer_pushes.track_io_futures(list(session_records[session].values()), [future])
-
-                    writes: list[Callable[[], None]] = [partial(write, *session) for session in sessions]
+                # ponytail: one transaction per slab; use byte leases only if transfers saturate it.
+                with self._staging_lock:
+                    acquired_at = time.monotonic()
+                    stage_ms["admission"] = (acquired_at - stage_started_at) * 1000
+                    stage_started_at = acquired_at
+                    staged = None
                     try:
-                        self._run_fanout(writes, track_write)
+                        try:
+                            staged = self._producer_memory.stage(tensors)
+                            if staged is None:
+                                raise RuntimeError("Mooncake EC producer batch exceeds NPU staging pool capacity")
+                            sources = staged.tensors
+                            # Mooncake reads outside the NPU stream.
+                            if sources:
+                                torch.npu.current_stream(sources[0].device).synchronize()
+                            addresses = [tensor.data_ptr() for tensor in sources]
+                        finally:
+                            stage_ms["register"] = (time.monotonic() - stage_started_at) * 1000
+                        by_session: dict[str, list[tuple[int, int]]] = {}
+                        session_records: dict[str, dict[str, ProducerPushRecord]] = {}
+                        for push, shard in ready:
+                            session = str(shard["dst_session"])
+                            by_session.setdefault(session, []).append(
+                                (source_index[push.spec.transfer_id], int(shard["dst_ptr"]))
+                            )
+                            session_records.setdefault(session, {})[push.spec.transfer_id] = push
+                        stage_started_at = time.monotonic()
+
+                        def write(session: str, items: list[tuple[int, int]]) -> None:
+                            self._transfer.write(
+                                session,
+                                [addresses[index] for index, _ in items],
+                                [dst for _, dst in items],
+                                [lengths[index] for index, _ in items],
+                            )
+
+                        sessions = list(by_session.items())
+
+                        # Write destinations concurrently to avoid serial transfer latency.
+                        def track_write(index: int, future: Future[None]) -> None:
+                            session = sessions[index][0]
+                            self._producer_pushes.track_io_futures(list(session_records[session].values()), [future])
+
+                        writes: list[Callable[[], None]] = [partial(write, *session) for session in sessions]
+                        try:
+                            self._run_fanout(writes, track_write)
+                        finally:
+                            stage_ms["transfer"] = (time.monotonic() - stage_started_at) * 1000
                     finally:
-                        stage_ms["transfer"] = (time.monotonic() - stage_started_at) * 1000
-                finally:
-                    stage_started_at = time.monotonic()
-                    self._producer_memory.release(staged)
-                    stage_ms["unregister"] = (time.monotonic() - stage_started_at) * 1000
+                        stage_started_at = time.monotonic()
+                        if staged is not None:
+                            self._producer_memory.release(staged)
+                        stage_ms["unregister"] = (time.monotonic() - stage_started_at) * 1000
 
             self._producer_pushes.begin_notifying(pushes)
             stage_started_at = time.monotonic()
@@ -956,6 +965,7 @@ class ECMooncakeWorker:
                 for stage, duration_ms, boundary in (
                     ("producer_reservation_wait_completed", reservation_wait_ms, "batch_reservation_future_wait"),
                     ("producer_device_ready_completed", stage_ms["device"], "batch_source_event_wait"),
+                    ("producer_staging_wait_completed", stage_ms["admission"], "batch_wait_for_registered_slab"),
                     ("producer_staging_copy_completed", stage_ms["register"], "batch_staging_copy_and_stream_sync"),
                     (
                         "producer_staging_completed",
@@ -1133,6 +1143,7 @@ class ECMooncakeWorker:
             self._io_executor,
             self._push_batch,
             self._note_push_batch_queued,
+            max_batch_bytes=self._producer_memory.capacity,
             wait=wait,
         )
 

@@ -393,6 +393,8 @@ class ConsumerControlServer:
                         metrics[f"request_{op}"] += 1
                         if op in ("reserve", "reserve_batch"):
                             items = request["items"] if op == "reserve_batch" else [request]
+                            metrics["reservations_reaped"] += self._reap()
+                            last_reap_at = time.monotonic()
                             results = []
                             for item in items:
                                 try:

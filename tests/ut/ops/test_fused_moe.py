@@ -154,6 +154,7 @@ def test_ascend_routed_experts_replaces_only_unquantized_method_after_parent_ini
         "get_current_vllm_config",
         lambda: SimpleNamespace(
             use_v2_model_runner=False,
+            is_mm_encoder_only=False,
             model_config=SimpleNamespace(is_deepseek_mla=False),
         ),
     )
@@ -196,10 +197,14 @@ def test_ascend_routed_experts_accepts_tid2eid_parameter_before_module_init(monk
     parent_init.assert_called_once()
 
 
-@pytest.mark.parametrize(("use_v2_model_runner", "legacy_init_calls"), [(True, 0), (False, 1)])
+@pytest.mark.parametrize(
+    ("use_v2_model_runner", "is_mm_encoder_only", "legacy_init_calls"),
+    [(True, False, 0), (False, True, 0), (False, False, 1)],
+)
 def test_ascend_routed_experts_initializes_only_matching_eplb_path(
     monkeypatch,
     use_v2_model_runner,
+    is_mm_encoder_only,
     legacy_init_calls,
 ):
     def parent_init(instance, *args, **kwargs):
@@ -224,6 +229,7 @@ def test_ascend_routed_experts_initializes_only_matching_eplb_path(
         "get_current_vllm_config",
         lambda: SimpleNamespace(
             use_v2_model_runner=use_v2_model_runner,
+            is_mm_encoder_only=is_mm_encoder_only,
             model_config=SimpleNamespace(is_deepseek_mla=False),
         ),
     )

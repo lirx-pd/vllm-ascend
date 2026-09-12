@@ -375,7 +375,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         self.global_redundant_expert_num: int = 0
         self.ascend_pertoken_scale: torch.Tensor | None = None
         self.ascend_mc2_mask: torch.Tensor | None = None
-        if not self._use_v2_model_runner:
+        if not self._use_v2_model_runner and not vllm_config.is_mm_encoder_only:
             self.init_eplb(n_shared_experts)
         self.return_with_event = False
 

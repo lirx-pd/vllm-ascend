@@ -22,20 +22,20 @@ _spec.loader.exec_module(proxy)
 
 
 class ProxyIdentityTest(unittest.IsolatedAsyncioTestCase):
-    def test_fixed_item_positions_rotate_across_all_encoders(self):
+    def test_load_assignment_balances_and_avoids_busy_encoder(self):
         for encoder_count in (1, 2, 3, 4):
-            encoders = [f"http://e{i}" for i in range(encoder_count)]
-            for item_count in (1, 2, 3, 4, 6):
-                with self.subTest(encoders=encoder_count, items=item_count):
-                    cursor = 0
-                    assignments = []
-                    for _ in encoders:
-                        urls, cursor = proxy.encoder_rr_assignment(encoders, cursor, item_count)
-                        assignments.append(urls)
-                    for item_index in range(item_count):
-                        self.assertCountEqual([urls[item_index] for urls in assignments], encoders)
-                    self.assertEqual(cursor, 0)
-            self.assertEqual(proxy.encoder_rr_assignment(encoders, encoder_count - 1, 0), ([], encoder_count - 1))
+            inflight = [0] * encoder_count
+            assignments, cursor = proxy.encoder_load_assignment(inflight, 0, encoder_count * 2)
+            self.assertEqual(assignments, list(range(encoder_count)) * 2)
+            self.assertEqual(inflight, [2] * encoder_count)
+            self.assertEqual(cursor, 1 % encoder_count)
+
+        inflight = [2, 0, 1]
+        assignments, cursor = proxy.encoder_load_assignment(inflight, 0, 3)
+        self.assertEqual(assignments, [1, 2, 1])
+        self.assertEqual(inflight, [2, 2, 2])
+        self.assertEqual(cursor, 1)
+        self.assertEqual(proxy.encoder_load_assignment(inflight, cursor, 0), ([], cursor))
 
     async def test_concurrent_four_image_requests_balance_large_image_over_http(self):
         images = [{"type": "image_url", "image_url": {"url": f"image-{i}.png"}, "uuid": f"image-{i}"} for i in range(4)]
@@ -63,7 +63,8 @@ class ProxyIdentityTest(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(proxy, "encode_session", session),
                 patch.object(proxy, "NO_REWRITE", False),
-                patch.object(proxy, "encoder_rr_idx", 0),
+                patch.object(proxy, "encoder_cursor", 0),
+                patch.object(proxy, "encoder_inflight", [0, 0]),
             ):
                 results = await asyncio.gather(
                     *(proxy.fanout_encoder_primer(request, encoders, str(i), "tcp://consumer") for i in range(32))
@@ -100,7 +101,61 @@ class ProxyIdentityTest(unittest.IsolatedAsyncioTestCase):
             proxy.content_uuid({"type": "image_url", "image_url": {"url": "same.png"}}),
         )
 
-    async def test_per_image_round_robin_and_metadata_only_decode(self):
+    async def test_busy_encoder_is_avoided_until_its_request_finishes(self):
+        started = asyncio.Event()
+        finish = asyncio.Event()
+        targets = []
+
+        async def encode(url, **_kwargs):
+            targets.append(url)
+            if url.startswith("http://e0"):
+                started.set()
+                await finish.wait()
+            response = MagicMock(status=200)
+            response.read = AsyncMock(return_value=b"{}")
+            return response
+
+        session = AsyncMock()
+        session.post.side_effect = encode
+        request = {"messages": [{"content": [{"type": "image_url", "image_url": {"url": "test.png"}}]}]}
+        with (
+            patch.object(proxy, "encode_session", session),
+            patch.object(proxy, "encoder_cursor", 0),
+            patch.object(proxy, "encoder_inflight", [0, 0]),
+        ):
+            first = asyncio.create_task(proxy.fanout_encoder_primer(request, ["http://e0", "http://e1"], "first"))
+            await started.wait()
+            await proxy.fanout_encoder_primer(request, ["http://e0", "http://e1"], "second")
+            self.assertEqual(targets, ["http://e0/v1/chat/completions", "http://e1/v1/chat/completions"])
+            self.assertEqual(proxy.encoder_inflight, [1, 0])
+            finish.set()
+            await first
+            self.assertEqual(proxy.encoder_inflight, [0, 0])
+
+    async def test_cancelled_encoder_request_releases_load(self):
+        started = asyncio.Event()
+
+        async def encode(*_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        session = AsyncMock()
+        session.post.side_effect = encode
+        request = {"messages": [{"content": [{"type": "image_url", "image_url": {"url": "test.png"}}]}]}
+        with (
+            patch.object(proxy, "encode_session", session),
+            patch.object(proxy, "encoder_cursor", 0),
+            patch.object(proxy, "encoder_inflight", [0]),
+        ):
+            call = asyncio.create_task(proxy.fanout_encoder_primer(request, ["http://e0"], "request"))
+            await started.wait()
+            call.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await call
+            await asyncio.sleep(0)
+            self.assertEqual(proxy.encoder_inflight, [0])
+
+    async def test_per_image_balancing_and_metadata_only_decode(self):
         image = {"type": "image_url", "image_url": {"url": "test.png"}}
         request = {"messages": [{"content": [image, image, image]}]}
 
@@ -119,7 +174,8 @@ class ProxyIdentityTest(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(proxy, "encode_session", session),
             patch.object(proxy, "NO_REWRITE", False),
-            patch.object(proxy, "encoder_rr_idx", 0),
+            patch.object(proxy, "encoder_cursor", 0),
+            patch.object(proxy, "encoder_inflight", [0, 0]),
         ):
             for req_id in ("first", "second"):
                 metadata = await proxy.fanout_encoder_primer(
@@ -514,6 +570,38 @@ class ProxyFailureTest(unittest.IsolatedAsyncioTestCase):
             )
         failed.release.assert_called_once()
         sibling.release.assert_called_once()
+
+    async def test_encoder_cancellation_releases_load_and_completed_response(self):
+        sibling_started = asyncio.Event()
+        wait_forever = asyncio.Event()
+        completed = MagicMock(status=200)
+        session = AsyncMock()
+
+        async def post(*_args, **_kwargs):
+            if session.post.await_count == 1:
+                return completed
+            sibling_started.set()
+            await wait_forever.wait()
+
+        session.post.side_effect = post
+        image = {"type": "image_url", "image_url": {"url": "test.png"}}
+        with (
+            patch.object(proxy, "encode_session", session),
+            patch.object(proxy, "encoder_cursor", 0),
+            patch.object(proxy, "encoder_inflight", [0]),
+        ):
+            request = asyncio.create_task(
+                proxy.fanout_encoder_primer(
+                    {"messages": [{"content": [image, image]}]}, ["http://encoder"], "request"
+                )
+            )
+            await sibling_started.wait()
+            await asyncio.sleep(0)
+            request.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+            self.assertEqual(proxy.encoder_inflight, [0])
+        completed.release.assert_called_once()
 
 
 class ProxyConnectionTest(unittest.IsolatedAsyncioTestCase):

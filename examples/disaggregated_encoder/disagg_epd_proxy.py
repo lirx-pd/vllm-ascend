@@ -52,10 +52,10 @@ encode_session: aiohttp.ClientSession | None = None
 prefill_session: aiohttp.ClientSession | None = None
 decode_session: aiohttp.ClientSession | None = None
 
-# Cursor for round-robin encoder assignment, shared across requests so the
-# fan-out doesn't restart from e_urls[0] every time.
-encoder_rr_idx = 0
-encoder_rr_lock = asyncio.Lock()
+# Local outstanding work per encoder. The proxy runs on one asyncio event loop,
+# so synchronous reservation and completion callbacks cannot interleave.
+encoder_inflight: list[int] = []
+encoder_cursor = 0
 
 ###############################################################################
 # Utils
@@ -65,15 +65,25 @@ encoder_rr_lock = asyncio.Lock()
 MM_TYPES = {"image_url", "audio_url", "input_audio", "video_url"}
 
 
-def encoder_rr_assignment(e_urls: list[str], start: int, count: int) -> tuple[list[str], int]:
-    """Assign `count` items to encoder URLs starting from cursor `start`.
+def encoder_load_assignment(inflight: list[int], start: int, count: int) -> tuple[list[int], int]:
+    """Reserve items on least-loaded encoders, using `start` to break ties."""
+    assignments = []
+    encoder_count = len(inflight)
+    next_start = (start + 1) % encoder_count if count else start
+    for _ in range(count):
+        selected = start
+        for offset in range(1, encoder_count):
+            candidate = (start + offset) % encoder_count
+            if inflight[candidate] < inflight[selected]:
+                selected = candidate
+        inflight[selected] += 1
+        assignments.append(selected)
+        start = (selected + 1) % encoder_count
+    return assignments, next_start
 
-    Rotate the starting encoder once per nonempty request so fixed item
-    positions do not stay on the same encoder when counts share a divisor.
-    """
-    urls = [e_urls[(start + i) % len(e_urls)] for i in range(count)]
-    next_start = (start + 1) % len(e_urls) if count else start
-    return urls, next_start
+
+def release_encoder_load(inflight: list[int], index: int) -> None:
+    inflight[index] -= 1
 
 
 # Diagnostic switch: forward the original request to the decoder so the
@@ -251,15 +261,10 @@ async def fanout_encoder_primer(
 
     logger.info("[%s] got %d multimodal items...", req_id, len(mm_items))
 
-    tasks = []
+    encoder_requests = []
     item_meta: dict[int, dict] = {}
 
-    # Rotate the first encoder per request, then round-robin its media items.
-    global encoder_rr_idx
-    async with encoder_rr_lock:
-        url_cycle, encoder_rr_idx = encoder_rr_assignment(e_urls, encoder_rr_idx, len(mm_items))
-
-    for idx, (item, target_url) in enumerate(zip(mm_items, url_cycle)):
+    for idx, item in enumerate(mm_items):
         # Derive a *child* request id:  <parent>:<index>:<random-short>
         child_req_id = f"{req_id}:{idx}:{uuid.uuid4().hex[:6]}"
         headers = {"x-request-id": child_req_id}
@@ -291,14 +296,34 @@ async def fanout_encoder_primer(
                 "consumer_zmq": consumer_zmq,
                 "ec_items": [{"mm_hash": item_uuid, "transfer_id": transfer_id}],
             }
-        tasks.append(encoder_post(target_url, encoder_req, headers, req_id, transfer_id))
+        encoder_requests.append((encoder_req, headers, transfer_id))
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Reserve and start the whole fan-out without yielding to another request.
+    global encoder_cursor, encoder_inflight
+    if len(encoder_inflight) != len(e_urls):
+        encoder_inflight = [0] * len(e_urls)
+    inflight = encoder_inflight
+    assignments, encoder_cursor = encoder_load_assignment(inflight, encoder_cursor, len(encoder_requests))
+    tasks = []
+    try:
+        for encoder_index, (encoder_req, headers, transfer_id) in zip(assignments, encoder_requests):
+            task = asyncio.create_task(
+                encoder_post(e_urls[encoder_index], encoder_req, headers, req_id, transfer_id)
+            )
+            task.add_done_callback(
+                lambda _task, loads=inflight, index=encoder_index: release_encoder_load(loads, index)
+            )
+            tasks.append(task)
+    except BaseException:
+        for encoder_index in assignments[len(tasks) :]:
+            release_encoder_load(inflight, encoder_index)
+        raise
 
     try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         # Fail fast if any sub-request failed
         for idx, r in enumerate(results):
-            if isinstance(r, Exception):
+            if isinstance(r, BaseException):
                 logger.error(
                     "[%s] Encoder request #%d raised exception: %s",
                     req_id,
@@ -331,8 +356,12 @@ async def fanout_encoder_primer(
                         item_meta[idx]["image_grid_thw"] = reported["image_grid_thw"]
                         break
     finally:
-        for response in results:
-            if not isinstance(response, BaseException):
+        for task in tasks:
+            if task.done() and not task.cancelled():
+                try:
+                    response = task.result()
+                except BaseException:
+                    continue
                 response.release()
 
     logger.info("[%s] All %d encoder requests completed successfully", req_id, len(mm_items))

@@ -1,10 +1,40 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from vllm.config import CUDAGraphMode
 from vllm.sequence import IntermediateTensors
 
 from tests.ut.base import TestBase
+
+
+@pytest.mark.parametrize("use_v2, encoder_only", [(False, False), (False, True), (True, False), (True, True)])
+def test_init_device_selects_encoder_runner_only_for_v2(use_v2, encoder_only):
+    from vllm_ascend.worker.worker import NPUWorker
+
+    worker = NPUWorker.__new__(NPUWorker)
+    worker.use_v2_model_runner = use_v2
+    worker.vllm_config = SimpleNamespace(is_mm_encoder_only=encoder_only)
+    worker.rank = 1
+    with (
+        patch.object(NPUWorker, "_init_device", return_value="npu:0"),
+        patch("vllm_ascend.worker.worker.init_workspace_manager"),
+        patch("vllm_ascend.worker.worker.NPUModelRunner") as v1,
+        patch("vllm_ascend.worker.v2.mm_encoder_model_runner.NPUEncoderModelRunner") as encoder,
+        patch("vllm_ascend.worker.v2.model_runner.NPUModelRunner") as v2,
+    ):
+        worker.init_device()
+        if not use_v2:
+            selected = v1
+        elif encoder_only:
+            selected = encoder
+        else:
+            selected = v2
+        selected.assert_called_once_with(worker.vllm_config, "npu:0")
+        assert worker.model_runner is selected.return_value
+        for other in (v1, v2, encoder):
+            if other is not selected:
+                other.assert_not_called()
 
 
 class TestNPUWorkerV2(TestBase):

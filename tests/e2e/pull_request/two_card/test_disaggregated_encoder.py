@@ -15,6 +15,9 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import json
+from pathlib import Path
+
 import pytest
 from vllm.utils.network_utils import get_open_port
 
@@ -25,16 +28,24 @@ from tools.send_mm_request import send_image_request
 MODELS = [
     "Qwen/Qwen2.5-VL-7B-Instruct",
 ]
-SHARED_STORAGE_PATH = "/dev/shm/epd/storage"
 TENSOR_PARALLELS = [1]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("tp_size", TENSOR_PARALLELS)
-async def test_models(model: str, tp_size: int) -> None:
+@pytest.mark.parametrize("use_v2", [False, True], ids=["mrv1", "mrv2"])
+async def test_models(model: str, tp_size: int, use_v2: bool, tmp_path: Path) -> None:
     encode_port = get_open_port()
     pd_port = get_open_port()
+    ec_configs = []
+    for role in ("ec_producer", "ec_consumer"):
+        ec_config = {
+            "ec_connector": "ECExampleConnector",
+            "ec_role": role,
+            "ec_connector_extra_config": {"shared_storage_path": str(tmp_path / "ec_cache")},
+        }
+        ec_configs.append(json.dumps(ec_config))
     vllm_server_args = [
         [
             "--port",
@@ -54,9 +65,7 @@ async def test_models(model: str, tp_size: int) -> None:
             "--max-num-seqs",
             "1",
             "--ec-transfer-config",
-            '{"ec_connector_extra_config":{"shared_storage_path":"'
-            + SHARED_STORAGE_PATH
-            + '"},"ec_connector":"ECExampleConnector","ec_role": "ec_producer"}',
+            ec_configs[0],
         ],
         [
             "--port",
@@ -75,9 +84,7 @@ async def test_models(model: str, tp_size: int) -> None:
             "--max-num-seqs",
             "128",
             "--ec-transfer-config",
-            '{"ec_connector_extra_config":{"shared_storage_path":"'
-            + SHARED_STORAGE_PATH
-            + '"},"ec_connector":"ECExampleConnector","ec_role": "ec_consumer"}',
+            ec_configs[1],
         ],
     ]
     proxy_port = get_open_port()
@@ -94,7 +101,13 @@ async def test_models(model: str, tp_size: int) -> None:
         "disable",
     ]
 
-    with RemoteEPDServer(vllm_serve_args=vllm_server_args) as _, DisaggEpdProxy(proxy_args=proxy_args) as proxy:
+    with (
+        RemoteEPDServer(
+            vllm_serve_args=vllm_server_args,
+            env_dict={"VLLM_USE_V2_MODEL_RUNNER": str(int(use_v2))},
+        ),
+        DisaggEpdProxy(proxy_args=proxy_args) as proxy,
+    ):
         config = SingleNodeConfig(
             name=model,
             model=model,

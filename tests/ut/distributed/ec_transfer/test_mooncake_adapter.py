@@ -18,6 +18,8 @@ from vllm_ascend.distributed.ec_transfer.mooncake import (
     _AscendECMooncakeWorker,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.v2.mm_encoder_model_runner import NPUEncoderModelRunner
+from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 
 
 def test_registers_concrete_ascend_connector() -> None:
@@ -27,6 +29,106 @@ def test_registers_concrete_ascend_connector() -> None:
 
     assert connector is AscendECMooncakeConnector
     assert not inspect.isabstract(connector)
+
+
+@pytest.mark.parametrize(
+    "runner_cls, is_producer",
+    [(NPUEncoderModelRunner, True), (NPUModelRunnerV2, False)],
+    ids=["encoder-producer", "pd-consumer"],
+)
+@pytest.mark.parametrize("has_metadata", [False, True])
+def test_v2_idle_step_returns_ec_completions(runner_cls, has_metadata, is_producer):
+    runner, connector = _make_v2_ec_runner(runner_cls, is_producer)
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=0,
+        ec_connector_metadata=object() if has_metadata else None,
+        finished_req_ids={"finished"},
+    )
+    output = runner.execute_model(scheduler_output)
+    runner.model_state.execute_mm_encoder.assert_not_called()
+    if has_metadata:
+        if is_producer:
+            assert output.ec_connector_output.finished_sending == {"image"}
+            assert output.ec_connector_output.finished_recving is None
+            connector.start_save_caches.assert_called_once()
+            connector.start_load_caches.assert_not_called()
+        else:
+            assert output.ec_connector_output.finished_sending is None
+            assert output.ec_connector_output.finished_recving == {"image"}
+            connector.start_load_caches.assert_called_once_with(runner.ec_connector.encoder_cache)
+            connector.start_save_caches.assert_not_called()
+        connector.get_finished.assert_called_once_with({"finished"})
+        connector.clear_connector_metadata.assert_called_once()
+    else:
+        assert output.ec_connector_output is None
+        connector.bind_connector_metadata.assert_not_called()
+    assert EMPTY_MODEL_RUNNER_OUTPUT.ec_connector_output is None
+
+
+@pytest.mark.parametrize("fail_encoder", [False, True])
+def test_v2_encoder_publishes_new_cache_and_clears_metadata(fail_encoder):
+    runner, connector = _make_v2_ec_runner(NPUEncoderModelRunner)
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=4,
+        num_scheduled_tokens={"request": 4},
+        scheduled_encoder_inputs={"request": [0]},
+        ec_connector_metadata=object(),
+        finished_req_ids=set(),
+    )
+    cache = runner.ec_connector.encoder_cache
+    cache["old"] = object()
+
+    def encode(inputs):
+        assert inputs == {"request": [0]}
+        if fail_encoder:
+            raise RuntimeError("encoder failed")
+        cache["new"] = object()
+
+    runner.model_state.execute_mm_encoder.side_effect = encode
+    if fail_encoder:
+        with pytest.raises(RuntimeError, match="encoder failed"):
+            runner.execute_model(scheduler_output)
+        connector.save_caches.assert_not_called()
+    else:
+        output = runner.execute_model(scheduler_output)
+        assert output.req_ids == ["request"]
+        assert output.sampled_token_ids == [[]]
+        assert output.ec_connector_output.finished_sending == {"image"}
+        connector.save_caches.assert_called_once_with(encoder_cache=cache, mm_hash="new")
+    connector.start_save_caches.assert_called_once_with(encoder_cache=cache)
+    connector.clear_connector_metadata.assert_called_once()
+    assert runner.get_kv_cache_spec() == {}
+    assert runner.capture_model() == 0
+
+
+def _make_v2_ec_runner(runner_cls, is_producer=True):
+    from vllm.v1.worker.gpu.ec_connector import ActiveECConnector
+    from vllm.v1.worker.gpu.kv_connector import NO_OP_KV_CONNECTOR
+
+    runner = runner_cls.__new__(runner_cls)
+    runner._input_events = [Mock()]
+    runner._input_event_idx = 0
+    runner.lora_config = None
+    runner.ascend_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=False))
+    )
+    runner.kvpp = Mock()
+    runner.model_state = Mock()
+    runner.kv_connector = NO_OP_KV_CONNECTOR
+    for method in ("update_pp_decode_requests", "finish_requests", "free_states", "add_requests", "update_requests"):
+        setattr(runner, method, Mock())
+    runner.block_tables = Mock()
+    runner.gather_batch_req_state = Mock(return_value=(SimpleNamespace(num_tokens=4), None))
+    runner.prepare_inputs = Mock()
+    connector = Mock(is_producer=is_producer, is_consumer=not is_producer)
+    connector.get_finished.return_value = ({"image"}, None) if is_producer else (None, {"image"})
+    connector.build_connector_worker_meta.return_value = None
+    ec = ActiveECConnector.__new__(ActiveECConnector)
+    ec.encoder_cache = {}
+    ec.ec_connector = connector
+    ec.save_new_caches = is_producer
+    runner.ec_connector = ec
+    return runner, connector
 
 
 def test_rejects_non_ascend_transport() -> None:

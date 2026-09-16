@@ -68,6 +68,19 @@ def test_init_defaults_kernel_sizes_and_rebuilds_int32_slots():
         assert tables._block_table_pad_size == 16
 
 
+def test_encoder_only_empty_block_tables_skip_slot_mapping_kernel():
+    tables = _init_tables([], 2, 8, [], torch.device("cpu"))
+    assert tables.slot_mappings.shape == (0, 8)
+    assert tables.slot_mappings.dtype == torch.int32
+    custom_out = torch.empty(0, 8, dtype=torch.int64)
+    with patch("vllm_ascend.worker.v2.block_table._compute_slot_mappings_kernel") as kernel:
+        for out in (None, custom_out):
+            result = tables.compute_slot_mappings(torch.tensor([0]), torch.tensor([0, 3]), torch.arange(3), 3, out=out)
+            assert result.shape == (0, 3)
+            assert result.dtype == (torch.int32 if out is None else out.dtype)
+        kernel.__getitem__.assert_not_called()
+
+
 def test_init_keeps_explicit_kernel_block_sizes():
     tables = _init_tables(
         [8],

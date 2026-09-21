@@ -64,7 +64,8 @@ class AscendBlockTables(BlockTables):
         # touched by one token tile. Use the smallest kernel block size to form
         # one safe constexpr window for all groups, without staging a whole
         # row.
-        min_kernel_block_size = min(kernel_block_sizes)
+        # Encoder-only runners have no KV groups and never launch this kernel.
+        min_kernel_block_size = min(kernel_block_sizes, default=1)
         window_size = (self._triton_block_size + min_kernel_block_size - 1) // min_kernel_block_size + 1
         self._block_table_window_size = triton.next_power_of_2(window_size)
         # because we will override these attribute, delete these attribute to
@@ -90,6 +91,8 @@ class AscendBlockTables(BlockTables):
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
+        if num_groups == 0:
+            return slot_mappings[:, :num_tokens_padded]
         slot_mapping_enabled = self.slot_mapping_enabled
         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
             slot_mappings.shape[1],

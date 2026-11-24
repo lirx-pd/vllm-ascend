@@ -16,7 +16,7 @@ from vllm.model_executor.models.interfaces import SupportsMRoPE  # noqa: E402
 from vllm.models.hy_v4_flash.model import HYV4FlashModel  # noqa: E402
 from vllm.models.hy_v4_flash.reference import INDEX_DIM, mla_attention_probs, sparse_candidates  # noqa: E402
 
-from vllm_ascend.models.hy_v4_flash import engram  # noqa: E402
+from vllm_ascend.models.hy_v4_flash import attention, engram  # noqa: E402
 from vllm_ascend.models.hy_v4_flash.attention import (  # noqa: E402
     POSITION_LANES,
     AscendHYV4FlashAttention,
@@ -48,9 +48,14 @@ def _index_pool(ratio):
 
 
 @pytest.mark.parametrize("ratio", [None, 2, 3], ids=["swa", "indexpool", "indexpool-cross-page"])
+@pytest.mark.parametrize("batched_prefill", [False, True], ids=["small-tiles", "shared-kv"])
 @torch.inference_mode()
-def test_paged_prefill_and_decode_match_uninterrupted_attention(ratio, monkeypatch):
+def test_paged_prefill_and_decode_match_uninterrupted_attention(ratio, batched_prefill, monkeypatch):
     torch.manual_seed(9)
+    if batched_prefill:
+        monkeypatch.setattr(attention, "QUERY_CHUNK", 1)
+        monkeypatch.setattr(attention, "SWA_PREFILL_QUERY_CHUNK", 2)
+        monkeypatch.setattr(attention, "INDEXPOOL_PREFILL_QUERY_CHUNK", 2)
     layer = AscendHYV4FlashAttention.__new__(AscendHYV4FlashAttention)
     nn.Module.__init__(layer)
     layer.indexer = _index_pool(ratio) if ratio is not None else None
@@ -89,7 +94,18 @@ def test_paged_prefill_and_decode_match_uninterrupted_attention(ratio, monkeypat
         return out[: boundaries[1]], out[boundaries[1] :]
 
     layer.kv_cache = torch.zeros(cache_shape, dtype=torch.bfloat16)
-    full = run([0, 0], [7, 4])
+    with monkeypatch.context() as context:
+        gathers = []
+        gather = layer._gather
+
+        def record_gather(block_table, positions):
+            gathers.append(positions.shape)
+            return gather(block_table, positions)
+
+        context.setattr(layer, "_gather", record_gather)
+        full = run([0, 0], [7, 4])
+        if batched_prefill:
+            assert gathers == [(7,), (4,)]
     layer.kv_cache.zero_()
     chunked = [run([0, 0], [3, 2]), run([3, 2], [6, 3]), run([6, 3], [7, 4])]
     for request, expected in enumerate(full):

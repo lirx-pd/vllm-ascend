@@ -7,6 +7,7 @@ import torch
 from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear, RowParallelLinear
@@ -27,8 +28,15 @@ from vllm.models.hy_v4_flash.reference import (
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
 
-# Process bounded query tiles in eager mode. The cache remains scheduler-owned.
+logger = init_logger(__name__)
+
 QUERY_CHUNK = 16
+SWA_PREFILL_QUERY_CHUNK = 512
+INDEXPOOL_PREFILL_QUERY_CHUNK = 256
+# Limit extra QK/PV work when scoring sparse candidates over a request's KV.
+INDEXPOOL_PREFILL_MAX_KV_RATIO = 8
+# At most 64 MiB for each FP32 IndexPool per-head score temporary.
+INDEXPOOL_PREFILL_SCORE_ELEMENTS = 16 * 1024 * 1024
 POSITION_AXES = 3
 POSITION_LANES = POSITION_AXES * torch.int64.itemsize // torch.bfloat16.itemsize
 
@@ -318,6 +326,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
     def _attend(self, meta, hidden, q_c, positions, query, wv, out):
         num_tokens = query.shape[0]
         indexer = self.indexer
+        candidate_width = (indexer.budget + 1) * indexer.ratio if indexer is not None else self.window
         cache_groups = indexer is not None and self.max_model_len > (indexer.budget + 1) * indexer.ratio
         uses_indexpool = cache_groups and any(
             (length - 1) // indexer.ratio > indexer.budget for length in meta.seq_lens
@@ -331,6 +340,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             if start == stop:
                 continue
             table = meta.block_table[request]
+            batched = stop - start > QUERY_CHUNK and (
+                indexer is None or seq_len <= INDEXPOOL_PREFILL_MAX_KV_RATIO * candidate_width
+            )
             pool = None
             if cache_groups:
                 ratio = indexer.ratio
@@ -340,24 +352,77 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 if first < complete:
                     history = torch.arange(first, complete, device=query.device)
                     self._store_index_pool(table, history, positions.ndim)
-                if (seq_len - 1) // ratio > indexer.budget:
+
+            key_start = 0
+            request_kv = None
+            rows = None
+            chunk = QUERY_CHUNK
+            if batched:
+                logger.info_once("HYV4 Flash uses shared KV for batched prefill attention.")
+                if indexer is None:
+                    key_start = max(0, seq_len - (stop - start) + 1 - self.window)
+                    chunk = min(SWA_PREFILL_QUERY_CHUNK, self.window)
+                else:
+                    chunk = INDEXPOOL_PREFILL_QUERY_CHUNK
+                keys = torch.arange(key_start, seq_len, device=query.device)
+                rows = self._gather(table, keys)
+                key = rows[:, : self.kv_width].float().contiguous()
+                request_kv = (key, key[:, : self.latent_dim].contiguous())
+
+            if cache_groups and (seq_len - 1) // ratio > indexer.budget:
+                if rows is not None:
+                    pool = rows[ratio - 1 : complete : ratio, self.kv_width : self.kv_width + INDEX_DIM].float()
+                    scores_per_query = pool.shape[0] * indexer.num_heads
+                    chunk = min(chunk, max(1, INDEXPOOL_PREFILL_SCORE_ELEMENTS // scores_per_query))
+                else:
                     group_ends = torch.arange(ratio - 1, complete, ratio, device=query.device)
                     pool = self._read_pool(table, group_ends)
 
-            for lo in range(start, stop, QUERY_CHUNK):
-                hi = min(lo + QUERY_CHUNK, stop)
-                visible_len = seq_len - (stop - hi)
+            for lo in range(start, stop, chunk):
+                hi = min(lo + chunk, stop)
+                visible_len = seq_len - (stop - hi) - key_start
                 logical = torch.arange(visible_len - (hi - lo), visible_len, device=query.device)
-                if indexer is None:
-                    candidates = window_candidates(logical, min(self.window, visible_len))
-                elif pool is not None:
+                candidates = None
+                if pool is not None:
                     candidates = sparse_candidates(
                         index_query[lo:hi], index_weight[lo:hi], pool, logical, indexer.ratio, indexer.budget
                     )
-                else:
+
+                if request_kv is not None:
+                    key, value = request_kv
+                    first = 0
+                    if candidates is not None:
+                        # Route padded candidates to an extra column outside the KV span.
+                        selected = torch.zeros((hi - lo, visible_len + 1), dtype=torch.int32, device=query.device)
+                        selected.scatter_(1, candidates.masked_fill(candidates < 0, visible_len), 1)
+                        masked = selected[:, :-1] == 0
+                    else:
+                        if indexer is None:
+                            first = max(0, visible_len - (hi - lo) + 1 - self.window)
+                        visible = torch.arange(first, visible_len, device=query.device)
+                        masked = visible > logical[:, None]
+                        if indexer is None:
+                            masked |= visible <= logical[:, None] - self.window
+                    self._attend_shared_kv(
+                        key[first:visible_len], value[first:visible_len], masked, query[lo:hi], wv, out[lo:hi]
+                    )
+                    continue
+
+                if indexer is None:
+                    candidates = window_candidates(logical, min(self.window, visible_len))
+                elif candidates is None:
                     visible = torch.arange(visible_len, device=query.device)
                     candidates = visible.expand(hi - lo, -1).masked_fill(visible > logical[:, None], -1)
                 self._attend_rows(table, candidates, query[lo:hi], wv, out[lo:hi])
+
+    def _attend_shared_kv(self, key, value, masked, query, wv, out):
+        tokens, heads, _ = query.shape
+        scores = torch.mm(query.flatten(0, 1).float(), key.T).view(tokens, heads, -1)
+        scores.mul_(self.scale).masked_fill_(masked[:, None, :], -torch.inf)
+        sink = self.learnable_sink_param.view(1, heads, 1).expand(tokens, -1, -1)
+        probs = torch.cat((scores, sink), dim=-1).softmax(dim=-1)[..., :-1]
+        context = torch.mm(probs.flatten(0, 1), value).view(tokens, heads, self.latent_dim).to(query.dtype)
+        self._project_values(context, wv, out)
 
     def _attend_decode_graph(self, meta, hidden, q_c, positions, query, wv, out):
         seq_lens = meta.decode_seq_lens
@@ -425,6 +490,10 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         kv = kv.masked_fill(candidates[..., None] < 0, 0)
         probs = mla_attention_probs(query, kv, candidates, self.learnable_sink_param, self.scale)
         context = torch.bmm(probs, kv[..., : self.latent_dim].float()).to(query.dtype)
+        self._project_values(context, wv, out)
+
+    @staticmethod
+    def _project_values(context, wv, out):
         value = torch.bmm(context.transpose(0, 1).contiguous(), wv).transpose(0, 1)
         out.copy_(value.reshape_as(out))
 

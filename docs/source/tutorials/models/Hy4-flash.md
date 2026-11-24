@@ -1,9 +1,9 @@
 # Hy4 Flash on Ascend 910C
 
-The Atlas A3 implementation serves the BF16 [Tencent Hy4 Flash checkpoint](https://huggingface.co/tencent/Hy4-flash)
-with model runner V2 in eager mode. It uses BF16 paged KV, sliding-window and IndexPool attention,
-the learned attention sink, and TP-sharded Engram tables. The released checkpoint includes a vision
-tower for image and video inputs.
+The Atlas A3 implementation serves the [Tencent Hy4 Flash BF16 checkpoint](https://huggingface.co/tencent/Hy4-flash)
+and ModelSlim `W8A8_DYNAMIC` checkpoints with model runner V2. Both weight formats support eager execution
+and `FULL_DECODE_ONLY` ACLGraph with BF16 paged KV, sliding-window and IndexPool attention, learned attention
+sinks, and TP-sharded Engram tables. The Tencent checkpoint includes a vision tower for image and video inputs.
 
 ## Prepare vLLM
 
@@ -23,9 +23,11 @@ python3 -m pip install -e "$ASCEND_SRC"
 
 ## Start the service
 
-Set `MODEL_PATH` to the local BF16 checkpoint directory. The command uses a single Atlas A3
-node with 16 visible devices. The checkpoint's shard index records about 441 GB of weights.
-Engram tables use host memory with the configuration below.
+Set `MODEL_PATH` to a local ModelSlim `W8A8_DYNAMIC` checkpoint with its `quant_model_description.json`.
+Keep Engram and the IndexPool `key_value_projection` and `key_gate_projection` tensors in their original
+precision. Use symmetric INT8 weights with one weight scale per output channel.
+For the BF16 checkpoint, omit `--quantization ascend`. The command uses 16 visible Atlas A3 devices
+and stores the Engram tables in host memory. The BF16 checkpoint's shard index records about 441 GB of weights.
 
 ```bash
 export VLLM_VERSION=0.32.0
@@ -35,19 +37,23 @@ vllm serve "$MODEL_PATH" \
   --served-model-name hy4-flash \
   --dtype bfloat16 \
   --kv-cache-dtype bfloat16 \
+  --quantization ascend \
   --tensor-parallel-size 16 \
   --enable-expert-parallel \
-  --enforce-eager \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
   --engram-config '{"cpu_offload":true,"dp_shared_memory":false}' \
   --max-model-len 4096 \
   --max-num-batched-tokens 512 \
   --max-num-seqs 4
 ```
 
-Use greedy decoding to compare short prompts, text with images, and prompts longer than
-2048 tokens against the reference implementation. Longer prompts exercise IndexPool recall and
-the smaller batch token budget exercises chunked prefill. Check both the first generated token
-and subsequent decode tokens.
+For eager execution, replace `--compilation-config` and its value with `--enforce-eager`. ACLGraph captures
+eligible batches with one decode token per request. Prefill, mixed batches, and uncaptured sizes run in
+eager mode. Graph attention recomputes IndexPool keys at the captured context bound.
 
-This path requires PP, PCP and DCP of 1. Graph capture, FP8 weights or KV, speculative decoding,
-PD disaggregation, and FlashComm are outside the 910C eager implementation.
+Use greedy decoding to compare eager and graph outputs from the same checkpoint. Include short prompts,
+text with images, and prompts longer than 2048 tokens to exercise IndexPool recall. Check the first
+generated token and subsequent decode tokens. The MRV2 log emits `ACL graph replay is active for the V2 target model`
+when it first replays a graph.
+
+This path requires PP, PCP and DCP of 1 and speculative decoding, KV transfer, FlashComm and fused MC2 disabled.

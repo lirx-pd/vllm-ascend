@@ -413,14 +413,22 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         )
 
     def apply_gmm1_act_quant(self, mlp_compute_input: MoEMlpComputeInput):
-        hidden_states = mlp_compute_input.hidden_states
-        hidden_states, pertoken_scale = self._quant_hidden_states(hidden_states, mlp_compute_input.dynamic_scale)
-        layer = mlp_compute_input.layer
-        w1, w1_scale, _, _ = self._get_mlp_weights(layer)
         activation = mlp_compute_input.activation
         fusion = mlp_compute_input.fusion
         dynamic_eplb = mlp_compute_input.dynamic_eplb
         is_swigluoai_uninterleave = activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        if activation == MoEActivation.SILU and mlp_compute_input.swiglu_limit > 0 and not fusion:
+            from vllm_ascend.ops.fused_moe.moe_mlp import _unified_apply_activation
+
+            # The unfused dequant-SwiGLU and Triton paths ignore the SILU clamp.
+            hidden_states = self.apply_gmm1(mlp_compute_input)
+            hidden_states = _unified_apply_activation(mlp_compute_input, hidden_states, self)
+            return self.apply_act_quant(mlp_compute_input, hidden_states)
+
+        hidden_states = mlp_compute_input.hidden_states
+        hidden_states, pertoken_scale = self._quant_hidden_states(hidden_states, mlp_compute_input.dynamic_scale)
+        layer = mlp_compute_input.layer
+        w1, w1_scale, _, _ = self._get_mlp_weights(layer)
         is_mc2 = _EXTRA_CTX.moe_comm_type == MoECommType.MC2
 
         if _custom_gmm_swiglu_enabled(fusion, dynamic_eplb, activation):

@@ -98,7 +98,9 @@ class FlashNgramHashState(nn.Module):
         if not isinstance(metadata, dict) or layer_name not in metadata:
             output.fill_(-1)
             return
-        starts = metadata[layer_name].query_start_loc
+        self.prepare_batch_hashes(input_ids, lookback, metadata[layer_name].query_start_loc, output)
+
+    def prepare_batch_hashes(self, input_ids, lookback, starts, output):
         if self.lookup_table is None:
             raise ValueError("Missing checkpoint Engram token map")
         if lookback is None or lookback.shape != (len(starts) - 1, self.lookback_depth):

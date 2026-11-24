@@ -79,6 +79,9 @@ class HYV4FlashVLForConditionalGeneration(HYV4VLForConditionalGeneration):
     def get_model_state_cls():
         return AscendHYV4FlashForCausalLM.get_model_state_cls()
 
+    def process_weights_after_loading(self):
+        self.language_model.process_weights_after_loading()
+
     def load_weights(self, weights):
         with self.language_model.weight_loading_session():
             loaded = super().load_weights(weights)
@@ -97,6 +100,7 @@ class HYV4FlashVLForConditionalGeneration(HYV4VLForConditionalGeneration):
         intermediate_tensors=None,
         inputs_embeds=None,
         lookback_token_ids=None,
+        prepared_engram=None,
         **kwargs,
     ):
         return self.language_model(
@@ -105,4 +109,5 @@ class HYV4FlashVLForConditionalGeneration(HYV4VLForConditionalGeneration):
             intermediate_tensors,
             inputs_embeds=inputs_embeds,
             lookback_token_ids=lookback_token_ids,
+            prepared_engram=prepared_engram,
         )

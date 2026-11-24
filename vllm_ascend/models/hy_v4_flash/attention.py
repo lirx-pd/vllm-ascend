@@ -13,7 +13,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLi
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_rope
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
-from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionBackend
+from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionBackend, CacheOnlyAttentionImpl
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.hy_v4_flash.configs import SLIDING_ATTENTION
 from vllm.models.hy_v4_flash.reference import (
@@ -24,7 +24,7 @@ from vllm.models.hy_v4_flash.reference import (
     sparse_candidates,
     window_candidates,
 )
-from vllm.v1.attention.backend import AttentionMetadataBuilder
+from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
 
 # Process bounded query tiles in eager mode. The cache remains scheduler-owned.
@@ -39,9 +39,12 @@ class FlashAttentionMetadata:
     seq_lens: list[int]
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
+    decode_seq_lens: torch.Tensor | None = None
 
 
 class FlashMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetadata]):
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
@@ -54,6 +57,18 @@ class FlashMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetadata]):
             meta.slot_mapping,
         )
 
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        metadata = self.build(0, common_attn_metadata)
+        metadata.decode_seq_lens = common_attn_metadata.seq_lens
+        return metadata
+
+
+class FlashAttentionImpl(CacheOnlyAttentionImpl):
+    @staticmethod
+    def update_graph_params(*args, **kwargs):
+        # Captured ops read the device buffers that MRV2 refreshes before replay.
+        pass
+
 
 class FlashAttentionBackend(CacheOnlyAttentionBackend):
     @staticmethod
@@ -64,9 +79,13 @@ class FlashAttentionBackend(CacheOnlyAttentionBackend):
     def get_builder_cls():
         return FlashMetadataBuilder
 
+    @staticmethod
+    def get_impl_cls():
+        return FlashAttentionImpl
+
 
 class FlashIndexPool(nn.Module):
-    def __init__(self, config, rope_parameters, prefix):
+    def __init__(self, config, quant_config, rope_parameters, prefix):
         super().__init__()
         self.ratio = config.compressed_indexer_compress_ratio
         self.budget = config.compressed_indexer_group_topk - 1
@@ -80,13 +99,25 @@ class FlashIndexPool(nn.Module):
             raise ValueError("HYV4 Flash IndexPool requires default RoPE")
 
         self.query_projection = ReplicatedLinear(
-            config.q_lora_rank, self.num_heads * INDEX_DIM, bias=False, prefix=f"{prefix}.query_projection"
+            config.q_lora_rank,
+            self.num_heads * INDEX_DIM,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.query_projection",
         )
         self.head_weight_projection = ReplicatedLinear(
-            config.hidden_size, self.num_heads, bias=False, prefix=f"{prefix}.head_weight_projection"
+            config.hidden_size,
+            self.num_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.head_weight_projection",
         )
         self.token_key_projection = ReplicatedLinear(
-            config.hidden_size, INDEX_DIM, bias=False, prefix=f"{prefix}.token_key_projection"
+            config.hidden_size,
+            INDEX_DIM,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.token_key_projection",
         )
         self.token_key_norm = nn.RMSNorm(INDEX_DIM, eps=self.eps)
         self.key_value_projection = nn.Linear(INDEX_DIM, INDEX_DIM, bias=False, dtype=torch.float32)
@@ -139,6 +170,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         self.layer_name = f"{prefix}.attn"
         is_window_layer = config.layer_types[layer_idx] == SLIDING_ATTENTION
         self.window = config.sliding_window
+        self.max_model_len = vllm_config.model_config.max_model_len
         dim_prefix = "swa_" if is_window_layer else ""
         heads = getattr(config, f"{dim_prefix}num_attention_heads")
         self.local_heads = heads // get_tensor_model_parallel_world_size()
@@ -157,21 +189,39 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         cache_layers[self.layer_name] = self
 
         hidden = config.hidden_size
-        self.q_a_proj = ReplicatedLinear(hidden, config.q_lora_rank, bias=False, prefix=f"{prefix}.q_a_proj")
+        quant = vllm_config.quant_config
+        self.q_a_proj = ReplicatedLinear(
+            hidden, config.q_lora_rank, bias=False, quant_config=quant, prefix=f"{prefix}.q_a_proj"
+        )
         self.kv_a_proj_with_mqa = ReplicatedLinear(
-            hidden, self.kv_width, bias=False, prefix=f"{prefix}.kv_a_proj_with_mqa"
+            hidden, self.kv_width, bias=False, quant_config=quant, prefix=f"{prefix}.kv_a_proj_with_mqa"
         )
         self.q_a_layernorm = RMSNorm(config.q_lora_rank, config.rms_norm_eps)
         self.kv_a_layernorm = RMSNorm(self.latent_dim, config.rms_norm_eps)
         self.q_b_proj = ColumnParallelLinear(
-            config.q_lora_rank, heads * (self.nope_dim + self.rope_dim), bias=False, prefix=f"{prefix}.q_b_proj"
+            config.q_lora_rank,
+            heads * (self.nope_dim + self.rope_dim),
+            bias=False,
+            quant_config=quant,
+            prefix=f"{prefix}.q_b_proj",
         )
         self.kv_b_proj = ColumnParallelLinear(
-            self.latent_dim, heads * (self.nope_dim + self.v_dim), bias=False, prefix=f"{prefix}.kv_b_proj"
+            self.latent_dim,
+            heads * (self.nope_dim + self.v_dim),
+            bias=False,
+            quant_config=quant,
+            prefix=f"{prefix}.kv_b_proj",
         )
+        # This weight is consumed by absorbed MLA in ND layout.
         self.kv_b_proj.skip_weight_nz_conversion = True
-        self.linear_gate = ColumnParallelLinear(hidden, heads * self.v_dim, bias=False, prefix=f"{prefix}.linear_gate")
-        self.o_proj = RowParallelLinear(heads * self.v_dim, hidden, bias=False, prefix=f"{prefix}.o_proj")
+        self.kv_b_proj._fused_preprocess_managed = True
+        self.register_buffer("_kv_b_dense_weight", None, persistent=False)
+        self.linear_gate = ColumnParallelLinear(
+            hidden, heads * self.v_dim, bias=False, quant_config=quant, prefix=f"{prefix}.linear_gate"
+        )
+        self.o_proj = RowParallelLinear(
+            heads * self.v_dim, hidden, bias=False, quant_config=quant, prefix=f"{prefix}.o_proj"
+        )
         rope_parameters = config.rope_for_layer(layer_idx)
         self.rotary_emb = get_rope(
             self.rope_dim,
@@ -179,7 +229,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             rope_parameters=rope_parameters,
             is_neox_style=False,
         )
-        self.indexer = None if is_window_layer else FlashIndexPool(config, rope_parameters, f"{prefix}.indexer")
+        self.indexer = None if is_window_layer else FlashIndexPool(config, quant, rope_parameters, f"{prefix}.indexer")
         self.learnable_sink_param = nn.Parameter(torch.zeros(self.local_heads, dtype=torch.float32))
         set_weight_attrs(self.learnable_sink_param, {"weight_loader": sharded_weight_loader(0)})
         self.post_proj_norm = (
@@ -199,6 +249,18 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             dtype=torch.bfloat16,
         )
 
+    def prepare_kv_b_weight(self):
+        proj = self.kv_b_proj
+        if proj.weight.dtype != torch.int8:
+            return
+        # ModelSlim's post-load INT8 weights are [in, out], with one scale per
+        # output channel. Restore the dense [out, in] MLA projection once.
+        weight = (proj.weight.T.float() * proj.weight_scale.float().reshape(-1, 1)).to(proj.params_dtype)
+        if self._kv_b_dense_weight is None:
+            self._kv_b_dense_weight = weight.contiguous()
+        else:
+            self._kv_b_dense_weight.copy_(weight)
+
     def forward(self, positions, hidden_states):
         q_c = self.q_a_layernorm(self.q_a_proj(hidden_states)[0])
         q = self.q_b_proj(q_c)[0].reshape(-1, self.local_heads, self.nope_dim + self.rope_dim)
@@ -214,11 +276,16 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             num_tokens = meta.query_start_loc[-1]
             if num_tokens:
                 self._write_cache_rows(meta, hidden_states, kv_c, k_pe, positions, num_tokens)
-                weight = self.kv_b_proj.weight.reshape(self.local_heads, self.nope_dim + self.v_dim, self.latent_dim)
+                weight = self._kv_b_dense_weight if self._kv_b_dense_weight is not None else self.kv_b_proj.weight
+                weight = weight.reshape(self.local_heads, self.nope_dim + self.v_dim, self.latent_dim)
                 wk, wv = weight.split((self.nope_dim, self.v_dim), dim=1)
                 q_latent = torch.bmm(q_nope[:num_tokens].transpose(0, 1).contiguous(), wk.contiguous()).transpose(0, 1)
                 query = torch.cat((q_latent, q_pe[:num_tokens]), dim=-1)
-                self._attend(meta, hidden_states, q_c, positions, query, wv.transpose(1, 2).contiguous(), out)
+                wv = wv.transpose(1, 2).contiguous()
+                if meta.decode_seq_lens is None:
+                    self._attend(meta, hidden_states, q_c, positions, query, wv, out)
+                else:
+                    self._attend_decode_graph(meta, hidden_states, q_c, positions, query, wv, out)
 
         output = self.o_proj(out * self.linear_gate(hidden_states)[0].sigmoid())[0]
         return self.post_proj_norm(output) if self.post_proj_norm is not None else output
@@ -238,7 +305,14 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             rows.append(kv_c.new_zeros((num_tokens, INDEX_DIM + POSITION_LANES)))
         slots = meta.slot_mapping[:num_tokens].long()
         valid = slots >= 0
-        self.kv_cache.view(-1, self.cache_width).index_copy_(0, slots[valid], torch.cat(rows, dim=-1)[valid])
+        cache = self.kv_cache.view(-1, self.cache_width)
+        packed = torch.cat(rows, dim=-1)
+        if meta.decode_seq_lens is not None:
+            # Static shape during capture. Padding writes back the original
+            # value of slot zero in the scheduler's reserved page.
+            cache.index_copy_(0, slots.clamp_min(0), torch.where(valid[:, None], packed, cache[:1]))
+        else:
+            cache.index_copy_(0, slots[valid], packed[valid])
 
     def _attend(self, meta, hidden, q_c, positions, query, wv, out):
         num_tokens = query.shape[0]
@@ -260,10 +334,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 # shortcut: recompute complete groups in eager mode, cache them when tuning decode latency.
                 complete = seq_len // indexer.ratio * indexer.ratio
                 history = torch.arange(complete, device=query.device)
-                rows = self._gather(table, history)[:, self.kv_width :]
-                keys = rows[:, :INDEX_DIM]
-                coords = rows[:, INDEX_DIM:].contiguous().view(torch.int64)
-                pool = indexer.encode_keys(keys, coords[:, 0] if positions.ndim == 1 else coords.T)
+                pool = self._read_pool(table, history, positions.ndim)
 
             for lo in range(start, stop, QUERY_CHUNK):
                 hi = min(lo + QUERY_CHUNK, stop)
@@ -278,11 +349,58 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 else:
                     visible = torch.arange(visible_len, device=query.device)
                     candidates = visible.expand(hi - lo, -1).masked_fill(visible > logical[:, None], -1)
-                kv = self._gather(table, candidates.clamp_min(0))[..., : self.kv_width]
-                probs = mla_attention_probs(query[lo:hi], kv, candidates, self.learnable_sink_param, self.scale)
-                context = torch.bmm(probs, kv[..., : self.latent_dim].float()).to(query.dtype)
-                value = torch.bmm(context.transpose(0, 1).contiguous(), wv).transpose(0, 1)
-                out[lo:hi].copy_(value.reshape_as(out[lo:hi]))
+                self._attend_rows(table, candidates, query[lo:hi], wv, out[lo:hi])
+
+    def _attend_decode_graph(self, meta, hidden, q_c, positions, query, wv, out):
+        seq_lens = meta.decode_seq_lens
+        # The 910C runner captures one target query per request.
+        live = meta.slot_mapping[: query.shape[0]] >= 0
+        logical = (seq_lens.long() - 1).masked_fill(~live, -1)
+        max_context = min(self.max_model_len, meta.block_table.shape[-1] * self.kv_cache.shape[2])
+        indexer = self.indexer
+        score_groups = indexer is not None and max_context > (indexer.budget + 1) * indexer.ratio
+        if score_groups:
+            index_query, index_weight = indexer.encode_queries(
+                hidden[: query.shape[0]], q_c[: query.shape[0]], positions[..., : query.shape[0]]
+            )
+            complete = max_context // indexer.ratio * indexer.ratio
+            history = torch.arange(complete, device=query.device)
+        for request in range(query.shape[0]):
+            row = slice(request, request + 1)
+            table = meta.block_table[request]
+            visible = logical[row]
+            if indexer is None:
+                candidates = window_candidates(visible, min(self.window, max_context))
+            elif score_groups:
+                # shortcut: recompute the pool at the captured context bound, cache groups when tuning decode latency.
+                # Only causally complete groups may contribute. Read safe
+                # slots for the fixed-shape tail and mask the corresponding scores.
+                end = (visible + 1) // indexer.ratio * indexer.ratio
+                pool = self._read_pool(table, history.masked_fill(history >= end, 0), positions.ndim)
+                candidates = sparse_candidates(
+                    index_query[row], index_weight[row], pool, visible, indexer.ratio, indexer.budget
+                )
+                dense = torch.arange(candidates.shape[-1], device=query.device).unsqueeze(0)
+                dense = dense.masked_fill(dense > visible[:, None], -1)
+                candidates = torch.where((visible // indexer.ratio > indexer.budget)[:, None], candidates, dense)
+            else:
+                candidates = torch.arange(max_context, device=query.device).unsqueeze(0)
+                candidates = candidates.masked_fill(candidates > visible[:, None], -1)
+            self._attend_rows(table, candidates, query[row], wv, out[row])
+
+    def _read_pool(self, table, history, position_ndim):
+        rows = self._gather(table, history)[:, self.kv_width :]
+        keys = rows[:, :INDEX_DIM]
+        coords = rows[:, INDEX_DIM:].contiguous().view(torch.int64)
+        return self.indexer.encode_keys(keys, coords[:, 0] if position_ndim == 1 else coords.T)
+
+    def _attend_rows(self, table, candidates, query, wv, out):
+        kv = self._gather(table, candidates.clamp_min(0))[..., : self.kv_width]
+        kv = kv.masked_fill(candidates[..., None] < 0, 0)
+        probs = mla_attention_probs(query, kv, candidates, self.learnable_sink_param, self.scale)
+        context = torch.bmm(probs, kv[..., : self.latent_dim].float()).to(query.dtype)
+        value = torch.bmm(context.transpose(0, 1).contiguous(), wv).transpose(0, 1)
+        out.copy_(value.reshape_as(out))
 
     def _gather(self, block_table, positions):
         cache = self.kv_cache

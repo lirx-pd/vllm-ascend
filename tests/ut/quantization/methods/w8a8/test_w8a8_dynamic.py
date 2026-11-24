@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from tests.ut.base import TestBase
 from tests.ut.quantization.conftest_quantization import (
@@ -152,6 +153,23 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
         self.assertEqual(param_dict["w13_weight_offset"].shape, (self.num_experts, 2 * self.intermediate_size, 1))
         self.assertEqual(param_dict["w2_weight_scale"].dtype, torch.bfloat16)
         self.assertEqual(param_dict["w2_weight_offset"].shape, (self.num_experts, self.hidden_size, 1))
+
+    def test_unfused_silu_applies_clamp_before_dynamic_quant(self):
+        inputs = SimpleNamespace(activation=MoEActivation.SILU, fusion=False, dynamic_eplb=False, swiglu_limit=2.0)
+        gmm1 = torch.tensor([[5.0, -4.0, -3.0, 4.0]])
+
+        def swiglu(value):
+            gate, up = value.chunk(2, dim=-1)
+            return torch.nn.functional.silu(gate) * up
+
+        with (
+            patch.object(self.quant_method, "apply_gmm1", return_value=gmm1),
+            patch("torch_npu.npu_swiglu", side_effect=swiglu),
+            patch.object(self.quant_method, "apply_act_quant", side_effect=lambda _, value: (value, None)),
+        ):
+            activated, _ = self.quant_method.apply_gmm1_act_quant(inputs)
+        expected = torch.nn.functional.silu(torch.tensor([[2.0, -4.0]])) * torch.tensor([[-2.0, 2.0]])
+        torch.testing.assert_close(activated, expected)
 
     @patch("vllm_ascend.quantization.methods.w8a8.w8a8_dynamic._EXTRA_CTX")
     def test_apply_uses_explicit_dispatch_and_mlp_args(self, mock_extra_ctx):

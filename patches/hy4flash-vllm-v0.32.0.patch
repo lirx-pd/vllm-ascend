@@ -1648,10 +1648,10 @@ index 0000000000000000000000000000000000000000..45963cea38ce4f2d6e135307cfa52c9f
 +        text_kwargs["rope_parameters"] = rope
 diff --git a/vllm/models/hy_v4_flash/model.py b/vllm/models/hy_v4_flash/model.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..022aac8e52d180850c67156042cb66c319025847
+index 0000000000000000000000000000000000000000..337768fde00b974b5cf4ddf4f1ebd0777addfc82
 --- /dev/null
 +++ b/vllm/models/hy_v4_flash/model.py
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,470 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HYV4 Flash backbone using the public HYV4 checkpoint contract."""
@@ -1688,16 +1688,21 @@ index 0000000000000000000000000000000000000000..022aac8e52d180850c67156042cb66c3
 +
 +_EXPERT_WEIGHT = re.compile(
 +    r"(.*\.experts)\.(?:(\d+)\.)?(gate_proj|up_proj|down_proj|gate_up_proj)"
-+    r"(\.weight(?:_scale(?:_inv)?)?|_scale(?:_inv)?)?"
++    r"(\.weight(?:_scale(?:_inv)?|_offset)?|_scale(?:_inv)?)?"
 +)
 +
 +
-+def _check_fp8_storage(name: str, param: torch.Tensor, weight: torch.Tensor) -> None:
-+    if (weight.dtype in _FP8_DTYPES) != (param.dtype in _FP8_DTYPES):
++def _check_quantized_storage(
++    name: str, param: torch.Tensor, weight: torch.Tensor
++) -> None:
++    if (weight.dtype in _FP8_DTYPES) != (param.dtype in _FP8_DTYPES) or (
++        not name.endswith(".weight_offset")
++        and (weight.dtype == torch.int8) != (param.dtype == torch.int8)
++    ):
 +        raise ValueError(
 +            f"Flash checkpoint precision mismatch for {name}: "
 +            f"checkpoint has {weight.dtype}, runtime expects {param.dtype}. "
-+            "Check the FP8 exclusion list and checkpoint weight prefixes."
++            "Check the quantization configuration and checkpoint weight prefixes."
 +        )
 +
 +
@@ -1865,7 +1870,10 @@ index 0000000000000000000000000000000000000000..022aac8e52d180850c67156042cb66c3
 +                if target not in parameters:
 +                    raise ValueError(f"Unknown Flash expert weight: {name}")
 +                parameter = parameters[target]
-+                _check_fp8_storage(name, parameter, value)
++                _check_quantized_storage(name, parameter, value)
++                expected_rank = 3 if expert_id is None else 2
++                if suffix in ("_scale", "_offset") and value.ndim == expected_rank - 1:
++                    value = value.unsqueeze(-1)
 +                if expert_id is None:
 +                    if value.ndim != 3 or value.shape[0] != self.config.num_experts:
 +                        raise ValueError(
@@ -1909,8 +1917,15 @@ index 0000000000000000000000000000000000000000..022aac8e52d180850c67156042cb66c3
 +            if name not in parameters:
 +                raise ValueError(f"Unknown Flash checkpoint weight: {name}")
 +            parameter = parameters[name]
-+            _check_fp8_storage(name, parameter, value)
++            _check_quantized_storage(name, parameter, value)
 +            weight_shard = getattr(value, "shard_id", None)
++            if (
++                name.endswith((".weight_scale", ".weight_offset"))
++                and parameter.ndim == 2
++                and parameter.shape[-1] == 1
++                and value.ndim == 1
++            ):
++                value = value.unsqueeze(-1)
 +            self._record_part(name, weight_shard)
 +            loader: Any = getattr(parameter, "weight_loader", default_weight_loader)
 +            if weight_shard is None:
@@ -2015,13 +2030,20 @@ index 0000000000000000000000000000000000000000..022aac8e52d180850c67156042cb66c3
 +                    DefaultModelLoader,
 +                )
 +
++                parameters = dict(self.named_parameters())
 +                required = {
 +                    name
-+                    for name, _ in self.named_parameters()
++                    for name in parameters
 +                    if name.endswith((".weight", ".w13_weight", ".w2_weight"))
 +                    and not (
 +                        self.config.tie_word_embeddings and name == "lm_head.weight"
 +                    )
++                }
++                required |= {
++                    f"{name}_scale"
++                    for name in required
++                    if parameters[name].dtype == torch.int8
++                    and f"{name}_scale" in parameters
 +                }
 +                missing = required - self._loaded_weights
 +                if missing:
@@ -2198,10 +2220,10 @@ index 0000000000000000000000000000000000000000..eccbe8d9e54258fc7c842771fe33df56
 +        )
 diff --git a/vllm/models/hy_v4_flash/reference.py b/vllm/models/hy_v4_flash/reference.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..12db894da496b1305f1d0b5736b3b49bc3d037c2
+index 0000000000000000000000000000000000000000..c47525e683f867c2898b1ea3ba899c4ccd950744
 --- /dev/null
 +++ b/vllm/models/hy_v4_flash/reference.py
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,133 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Torch reference operations for HYV4 Flash."""
@@ -2265,8 +2287,11 @@ index 0000000000000000000000000000000000000000..12db894da496b1305f1d0b5736b3b49b
 +        groups = torch.arange(num_groups, device=keys.device)
 +        scores = scores.masked_fill(groups >= group_at_query[:, None], -torch.inf)
 +        count = min(history_budget, num_groups)
-+        scores, selected = scores.topk(count, dim=-1)
-+        selected = selected.masked_fill(scores == -torch.inf, num_groups)
++        # Break ties by group ID so graph padding cannot change the recalled groups.
++        scores, selected = scores.sort(dim=-1, descending=True, stable=True)
++        selected = selected[:, :count].masked_fill(
++            scores[:, :count] == -torch.inf, num_groups
++        )
 +        selected = selected.sort(dim=-1).values
 +        history = selected.unsqueeze(-1) * ratio + offsets
 +        history = history.masked_fill(

@@ -20,15 +20,22 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
     config.validate_flash_config()
     if get_ascend_device_type() is not AscendDeviceType.A3:
         raise ValueError("This HYV4 Flash implementation requires Atlas A3 (Ascend 910C)")
+    if not vllm_config.use_v2_model_runner:
+        raise ValueError("HYV4 Flash on 910C requires model runner V2")
     compilation = vllm_config.compilation_config
     if (
-        not vllm_config.use_v2_model_runner
-        or compilation.mode != CompilationMode.NONE
-        or compilation.cudagraph_mode != CUDAGraphMode.NONE
+        compilation.cudagraph_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY)
+        or compilation.cudagraph_mode == CUDAGraphMode.NONE
+        and compilation.mode != CompilationMode.NONE
     ):
-        raise ValueError("HYV4 Flash on 910C requires model runner V2 and --enforce-eager")
-    if model.dtype != torch.bfloat16 or model.quantization is not None or vllm_config.quant_config is not None:
-        raise ValueError("HYV4 Flash on 910C requires a BF16 checkpoint without weight quantization")
+        raise ValueError("HYV4 Flash on 910C supports eager or FULL_DECODE_ONLY ACLGraph")
+    if model.dtype != torch.bfloat16:
+        raise ValueError("HYV4 Flash on 910C requires BF16 compute")
+    quant_config = vllm_config.quant_config
+    if (quant_config is not None or model.quantization is not None) and (
+        model.quantization != "ascend" or quant_config is None
+    ):
+        raise ValueError("HYV4 Flash on 910C supports BF16 or ModelSlim W8A8_DYNAMIC checkpoints")
     if not FlashAttentionBackend.supports_kv_cache_dtype(vllm_config.cache_config.cache_dtype):
         raise ValueError("HYV4 Flash on 910C requires a BF16 KV cache")
     if vllm_config.speculative_config is not None or vllm_config.kv_transfer_config is not None:
@@ -90,10 +97,19 @@ class AscendHYV4FlashModel(HYV4FlashModel):
 
 class AscendHYV4FlashForCausalLM(HYV4FlashForCausalLM):
     model_cls = AscendHYV4FlashModel
+    supports_mrope = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         validate_runtime(vllm_config)
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    def process_weights_after_loading(self):
+        for layer in self.model.layers:
+            layer.self_attn.prepare_kv_b_weight()
+
+    @staticmethod
+    def get_mrope_input_positions(input_tokens, mm_features):
+        return torch.arange(len(input_tokens), device="cpu").expand(3, -1), 0
 
     @staticmethod
     def get_model_state_cls():

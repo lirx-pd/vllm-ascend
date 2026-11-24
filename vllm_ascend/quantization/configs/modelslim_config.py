@@ -780,6 +780,16 @@ class AscendModelSlimConfig(QuantizationConfig):
                 m = re.search(r"\.experts\.\d+\.(\w+)\.weight$", key)
                 if m:
                     shard_names.add(m.group(1))
+            if (
+                not shard_names
+                and model_type in ("hy_v4_flash", "hy_v4_flash_vl")
+                and any(
+                    key.endswith((".experts.gate_up_proj", ".experts.gate_up_proj.weight"))
+                    for key in self.quant_description
+                )
+            ):
+                # HYV4 Flash can keep the expert axis in packed gate/up and down tensors.
+                shard_names = {"gate_proj", "up_proj", "down_proj"}
             if shard_names:
                 self.packed_modules_mapping["experts"] = [f"experts.0.{name}" for name in sorted(shard_names)]
 
@@ -824,6 +834,8 @@ class AscendModelSlimConfig(QuantizationConfig):
                 self.packed_modules_mapping,
                 prefix_mapper=lambda name: self.quant_prefix_mapper(model_type, name),
             )
+        if model_type in ("hy_v4_flash", "hy_v4_flash_vl") and quant_type not in (None, "W8A8_DYNAMIC"):
+            raise ValueError(f"HYV4 Flash on 910C does not support {quant_type} for {prefix}")
 
         if isinstance(layer, LinearBase):
             if quant_type is None:

@@ -445,6 +445,17 @@ class TestAscendModelSlimConfig(TestBase):
         # Should not be overwritten
         self.assertEqual(config.packed_modules_mapping["experts"], ["experts.0.custom"])
 
+    def test_hy4_flash_resolves_packed_expert_quantization(self):
+        prefix = "model.layers.1.mlp.experts"
+        config = AscendModelSlimConfig(
+            {f"{prefix}.{name}.weight": "W8A8_DYNAMIC" for name in ("gate_up_proj", "down_proj")}
+        )
+        config._update_packed_modules_mapping("hy_v4_flash")
+        self.assertEqual(
+            get_quant_type_for_layer(config.quant_description, prefix, config.packed_modules_mapping),
+            "W8A8_DYNAMIC",
+        )
+
     def test_update_packed_modules_mapping_no_experts(self):
         """_update_packed_modules_mapping does nothing when no expert weights exist."""
         config = AscendModelSlimConfig(

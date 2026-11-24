@@ -25,8 +25,11 @@ from vllm.models.hy_v4_flash.reference import (
     sparse_candidates,
     window_candidates,
 )
+from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
+
+from vllm_ascend.ops.triton.hy_v4_indexpool import fused_indexpool_fp8, gather_paged_rows
 
 logger = init_logger(__name__)
 
@@ -37,8 +40,20 @@ INDEXPOOL_PREFILL_QUERY_CHUNK = 256
 INDEXPOOL_PREFILL_MAX_KV_RATIO = 8
 # At most 64 MiB for each FP32 IndexPool per-head score temporary.
 INDEXPOOL_PREFILL_SCORE_ELEMENTS = 16 * 1024 * 1024
+INDEXPOOL_FUSED_MAX_ROWS = 16
 POSITION_AXES = 3
 POSITION_LANES = POSITION_AXES * torch.int64.itemsize // torch.bfloat16.itemsize
+
+
+def _quantize_indexpool(vectors):
+    if (
+        HAS_TRITON
+        and vectors.device.type == "npu"
+        and vectors.is_contiguous()
+        and 0 < vectors.numel() <= INDEXPOOL_FUSED_MAX_ROWS * INDEX_DIM
+    ):
+        return fused_indexpool_fp8(vectors)
+    return indexpool_fp8(vectors)
 
 
 def _prefill_pool_mask(query, weights, pool, logical, ratio, budget, visible_len):
@@ -182,7 +197,7 @@ class FlashIndexPool(nn.Module):
     def encode_queries(self, hidden, q_c, positions):
         query = self.query_projection(q_c)[0].reshape(-1, self.num_heads, INDEX_DIM)
         weight = self.head_weight_projection(hidden)[0].float() * (self.num_heads * INDEX_DIM) ** -0.5
-        return indexpool_fp8(self.rotate(query, positions)), weight
+        return _quantize_indexpool(self.rotate(query, positions)), weight
 
     def encode_keys(self, raw, positions):
         pooled = pooled_keys(
@@ -193,7 +208,7 @@ class FlashIndexPool(nn.Module):
             self.key_norm.weight,
             self.eps,
         )
-        return indexpool_fp8(self.rotate(pooled, positions[..., :: self.ratio]))
+        return _quantize_indexpool(self.rotate(pooled, positions[..., :: self.ratio]))
 
 
 class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
@@ -461,6 +476,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         logical = (seq_lens.long() - 1).masked_fill(~live, -1)
         max_context = min(self.max_model_len, meta.block_table.shape[-1] * self.kv_cache.shape[2])
         indexer = self.indexer
+        fused_gather = HAS_TRITON and query.device.type == "npu"
         score_groups = indexer is not None and max_context > (indexer.budget + 1) * indexer.ratio
         if score_groups:
             index_query, index_weight = indexer.encode_queries(
@@ -479,7 +495,17 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 closes_group = (visible >= 0) & ((visible + 1) % ratio == 0)
                 group = visible + 1 - ratio + offsets
                 self._store_index_pool(table, group.masked_fill(~closes_group, 0), positions.ndim, closes_group)
-                pool = self._read_pool(table, group_ends.masked_fill(group_ends > visible, 0))
+                if fused_gather:
+                    pool = gather_paged_rows(
+                        self.kv_cache,
+                        table,
+                        group_ends.masked_fill(group_ends > visible, -1),
+                        self.kv_width,
+                        INDEX_DIM,
+                        torch.float32,
+                    )
+                else:
+                    pool = self._read_pool(table, group_ends.masked_fill(group_ends > visible, 0))
                 candidates = sparse_candidates(
                     index_query[row], index_weight[row], pool, visible, ratio, indexer.budget
                 )
@@ -489,7 +515,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             else:
                 candidates = torch.arange(max_context, device=query.device).unsqueeze(0)
                 candidates = candidates.masked_fill(candidates > visible[:, None], -1)
-            self._attend_rows(table, candidates, query[row], wv, out[row])
+            self._attend_rows(table, candidates, query[row], wv, out[row], fused_gather=fused_gather)
 
     def _store_index_pool(self, table, positions, position_ndim, valid=None):
         ratio = self.indexer.ratio
@@ -515,9 +541,12 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         rows = self._gather(table, group_ends)
         return rows[:, self.kv_width : self.kv_width + INDEX_DIM].float()
 
-    def _attend_rows(self, table, candidates, query, wv, out):
-        kv = self._gather(table, candidates.clamp_min(0))[..., : self.kv_width]
-        kv = kv.masked_fill(candidates[..., None] < 0, 0)
+    def _attend_rows(self, table, candidates, query, wv, out, *, fused_gather=False):
+        if fused_gather:
+            kv = gather_paged_rows(self.kv_cache, table, candidates, 0, self.kv_width, self.kv_cache.dtype)
+        else:
+            kv = self._gather(table, candidates.clamp_min(0))[..., : self.kv_width]
+            kv = kv.masked_fill(candidates[..., None] < 0, 0)
         probs = mla_attention_probs(query, kv, candidates, self.learnable_sink_param, self.scale)
         context = torch.bmm(probs, kv[..., : self.latent_dim].float()).to(query.dtype)
         self._project_values(context, wv, out)

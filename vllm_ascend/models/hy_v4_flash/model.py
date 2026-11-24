@@ -12,6 +12,7 @@ from vllm_ascend.device.hardware import AscendDeviceType
 
 from .attention import AscendHYV4FlashAttention, FlashAttentionBackend
 from .engram import FlashEngram, FlashNgramHashState
+from .ihc import AscendHYV4FlashHCLayer
 
 
 def _validate_weight_offset(name, offset):
@@ -117,6 +118,7 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
 
 class AscendHYV4FlashDecoderLayer(HYV4FlashDecoderLayer):
     attention_cls = AscendHYV4FlashAttention
+    hc_layer_cls = AscendHYV4FlashHCLayer
 
 
 class AscendHYV4FlashModel(HYV4FlashModel):

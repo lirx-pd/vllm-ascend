@@ -41,6 +41,32 @@ POSITION_AXES = 3
 POSITION_LANES = POSITION_AXES * torch.int64.itemsize // torch.bfloat16.itemsize
 
 
+def _prefill_pool_mask(query, weights, pool, logical, ratio, budget, visible_len):
+    current = logical[:, None] // ratio
+    positions = torch.arange(visible_len, device=logical.device)
+    token_groups = positions // ratio
+    future = positions > logical[:, None]
+    in_current = token_groups == current
+    if budget == 0:
+        return future | ~in_current
+
+    per_head = torch.matmul(query.transpose(0, 1), pool.T)
+    scores = (per_head.relu() * weights.T.unsqueeze(-1)).sum(0)
+    groups = torch.arange(pool.shape[0], device=logical.device)
+    scores.masked_fill_(groups >= current, -torch.inf)
+
+    count = min(budget, pool.shape[0])
+    scores, selected = scores.sort(dim=-1, descending=True, stable=True)
+    # The shared KV matmul only needs membership, so keep the stable recall
+    # order and scatter the chosen groups directly into the mask.
+    selected = selected[:, :count].masked_fill(scores[:, :count] == -torch.inf, pool.shape[0])
+    keep = torch.zeros((logical.numel(), pool.shape[0] + 1), dtype=torch.int32, device=logical.device)
+    keep.scatter_(1, selected, 1)
+    # Only the current group can contain a visible token beyond the complete pool.
+    from_history = keep.index_select(1, token_groups.clamp_max(pool.shape[0] - 1)) != 0
+    return future | ~(from_history | in_current)
+
+
 @dataclass
 class FlashAttentionMetadata:
     query_start_loc: list[int]
@@ -382,20 +408,20 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 hi = min(lo + chunk, stop)
                 visible_len = seq_len - (stop - hi) - key_start
                 logical = torch.arange(visible_len - (hi - lo), visible_len, device=query.device)
-                candidates = None
-                if pool is not None:
-                    candidates = sparse_candidates(
-                        index_query[lo:hi], index_weight[lo:hi], pool, logical, indexer.ratio, indexer.budget
-                    )
 
                 if request_kv is not None:
                     key, value = request_kv
                     first = 0
-                    if candidates is not None:
-                        # Route padded candidates to an extra column outside the KV span.
-                        selected = torch.zeros((hi - lo, visible_len + 1), dtype=torch.int32, device=query.device)
-                        selected.scatter_(1, candidates.masked_fill(candidates < 0, visible_len), 1)
-                        masked = selected[:, :-1] == 0
+                    if pool is not None and (visible_len - 1) // indexer.ratio > indexer.budget:
+                        masked = _prefill_pool_mask(
+                            index_query[lo:hi],
+                            index_weight[lo:hi],
+                            pool,
+                            logical,
+                            indexer.ratio,
+                            indexer.budget,
+                            visible_len,
+                        )
                     else:
                         if indexer is None:
                             first = max(0, visible_len - (hi - lo) + 1 - self.window)
@@ -410,9 +436,13 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
 
                 if indexer is None:
                     candidates = window_candidates(logical, min(self.window, visible_len))
-                elif candidates is None:
+                elif pool is None:
                     visible = torch.arange(visible_len, device=query.device)
                     candidates = visible.expand(hi - lo, -1).masked_fill(visible > logical[:, None], -1)
+                else:
+                    candidates = sparse_candidates(
+                        index_query[lo:hi], index_weight[lo:hi], pool, logical, indexer.ratio, indexer.budget
+                    )
                 self._attend_rows(table, candidates, query[lo:hi], wv, out[lo:hi])
 
     def _attend_shared_kv(self, key, value, masked, query, wv, out):

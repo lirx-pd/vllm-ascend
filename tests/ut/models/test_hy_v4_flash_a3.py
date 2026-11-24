@@ -225,6 +225,22 @@ def test_indexpool_ties_are_independent_of_graph_padding():
     torch.testing.assert_close(graph, eager)
 
 
+@pytest.mark.parametrize("budget", [0, 1, 2, 5])
+@pytest.mark.parametrize("pool_groups", [4, 6])
+def test_prefill_pool_mask_preserves_stable_recall_and_partial_tail(budget, pool_groups):
+    logical = torch.tensor([0, 2, 3, 5, 8, 10, 11, 13])
+    query = torch.ones(len(logical), 1, 2)
+    weights = torch.tensor([[1.0], [-1.0]]).repeat(4, 1)
+    pool = torch.tensor([[2.0, 0.0], [1.0, 0.0], [2.0, 0.0], [0.0, 0.0], [2.0, 0.0], [0.0, 0.0]])[:pool_groups]
+    ratio, visible_len = 3, 14
+    candidates = sparse_candidates(query, weights, pool, logical, ratio, budget)
+    expected = torch.ones(len(logical), visible_len + 1, dtype=torch.bool)
+    expected.scatter_(1, candidates.masked_fill(candidates < 0, visible_len), False)
+
+    actual = attention._prefill_pool_mask(query, weights, pool, logical, ratio, budget, visible_len)
+    torch.testing.assert_close(actual, expected[:, :visible_len], atol=0, rtol=0)
+
+
 def test_quantized_kv_b_weight_restores_out_in_layout_and_keeps_address():
     layer = AscendHYV4FlashAttention.__new__(AscendHYV4FlashAttention)
     nn.Module.__init__(layer)

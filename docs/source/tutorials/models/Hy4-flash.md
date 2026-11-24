@@ -25,7 +25,9 @@ python3 -m pip install -e "$ASCEND_SRC"
 
 Set `MODEL_PATH` to a local ModelSlim `W8A8_DYNAMIC` checkpoint with its `quant_model_description.json`.
 Keep Engram and the IndexPool `key_value_projection` and `key_gate_projection` tensors in their original
-precision. Use symmetric INT8 weights with one weight scale per output channel.
+precision. Use symmetric INT8 weights with one weight scale per output channel. Weight offsets can be omitted.
+Any supplied offset must be zero. A packed projection omitted from the quantization description runs in BF16.
+When describing split projections, include every shard with the same quantization type.
 For the BF16 checkpoint, omit `--quantization ascend`. The command uses 16 visible Atlas A3 devices
 and stores the Engram tables in host memory. The BF16 checkpoint's shard index records about 441 GB of weights.
 
@@ -49,7 +51,8 @@ vllm serve "$MODEL_PATH" \
 
 For eager execution, replace `--compilation-config` and its value with `--enforce-eager`. ACLGraph captures
 eligible batches with one decode token per request. Prefill, mixed batches, and uncaptured sizes run in
-eager mode. Graph attention recomputes IndexPool keys at the captured context bound.
+eager mode. Both paths cache each completed IndexPool group's key in its final token's cache row.
+Graph replay projects at most one group per request and scores cached group keys at the captured context bound.
 
 Use greedy decoding to compare eager and graph outputs from the same checkpoint. Include short prompts,
 text with images, and prompts longer than 2048 tokens to exercise IndexPool recall. Check the first

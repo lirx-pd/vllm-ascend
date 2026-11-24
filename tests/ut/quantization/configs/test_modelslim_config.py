@@ -456,6 +456,44 @@ class TestAscendModelSlimConfig(TestBase):
             "W8A8_DYNAMIC",
         )
 
+    def test_hy4_flash_unlisted_packed_projections_use_bf16(self):
+        model_type = "hy_v4_flash_vl"
+        vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)))
+        cases = [
+            ("model.layers.0.mlp.gate_up_proj", ["gate_proj", "up_proj"]),
+            ("visual.layers.0.self_attn.qkv", ["q_proj", "k_proj", "v_proj"]),
+        ]
+        for prefix, shards in cases:
+            with (
+                self.subTest(prefix=prefix),
+                patch(
+                    "vllm_ascend.quantization.configs.modelslim_config.get_current_vllm_config",
+                    return_value=vllm_config,
+                ),
+            ):
+                config = AscendModelSlimConfig({"model.layers.0.self_attn.q_a_proj.weight": "W8A8_DYNAMIC"})
+                module, name = prefix.rsplit(".", 1)
+                config.packed_modules_mapping = {name: shards}
+                layer = MagicMock(spec=LinearBase)
+                self.assertIsInstance(config.get_quant_method(layer, prefix), AscendUnquantizedLinearMethod)
+                for shard in shards[:-1]:
+                    config.quant_description[f"{module}.{shard}.weight"] = "W8A8_DYNAMIC"
+                with self.assertRaises(KeyError):
+                    config.get_quant_method(layer, prefix)
+
+    def test_hy4_flash_missing_expert_description_differs_from_incomplete(self):
+        prefix = "model.layers.0.mlp.experts"
+        model_type = "hy_v4_flash"
+        config = AscendModelSlimConfig({"model.layers.0.self_attn.q_a_proj.weight": "W8A8_DYNAMIC"})
+        config._update_packed_modules_mapping(model_type)
+        mapping = config.packed_modules_mapping
+        self.assertIsNone(get_quant_type_for_layer(config.quant_description, prefix, mapping, model_type=model_type))
+        for shard in ("down_proj", "gate_up_proj", "0.gate_proj", "1.up_proj"):
+            with self.subTest(shard=shard), self.assertRaises(KeyError):
+                get_quant_type_for_layer(
+                    {f"{prefix}.{shard}.weight": "W8A8_DYNAMIC"}, prefix, mapping, model_type=model_type
+                )
+
     def test_update_packed_modules_mapping_no_experts(self):
         """_update_packed_modules_mapping does nothing when no expert weights exist."""
         config = AscendModelSlimConfig(

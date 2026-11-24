@@ -16,7 +16,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.transformers_utils.processor import get_processor_kwargs_keys
 from vllm.transformers_utils.processors.hy_v4 import HYV4VLProcessor, HYV4VLProcessorKwargs
 
-from .model import AscendHYV4FlashForCausalLM
+from .model import AscendHYV4FlashForCausalLM, refresh_reloaded_weights
 
 
 class HYV4FlashVLProcessingInfo(HYV4VLProcessingInfo):
@@ -82,9 +82,12 @@ class HYV4FlashVLForConditionalGeneration(HYV4VLForConditionalGeneration):
     def process_weights_after_loading(self):
         self.language_model.process_weights_after_loading()
 
+    def process_weights_after_reload(self):
+        refresh_reloaded_weights(self)
+
     def load_weights(self, weights):
         with self.language_model.weight_loading_session():
-            loaded = super().load_weights(weights)
+            loaded = super().load_weights(self.language_model.prepare_checkpoint_weights(weights))
         required_visual = (
             {f"visual.{name}" for name, _ in self.visual.named_parameters()} if self.visual is not None else set()
         )

@@ -14,6 +14,36 @@ from .attention import AscendHYV4FlashAttention, FlashAttentionBackend
 from .engram import FlashEngram, FlashNgramHashState
 
 
+def _validate_weight_offset(name, offset):
+    if torch.count_nonzero(offset):
+        raise ValueError(f"HYV4 Flash W8A8_DYNAMIC requires a zero weight offset for {name}")
+
+
+def _with_symmetric_weight_offsets(weights):
+    for name, value in weights:
+        if name.endswith(".weight_offset"):
+            _validate_weight_offset(name, value)
+            continue
+        yield name, value
+        # Use the scale's shape and loader route for every TP/EP shard.
+        if name.endswith(".weight_scale"):
+            yield name.removesuffix("_scale") + "_offset", torch.zeros_like(value)
+        elif ".experts." in name and name.endswith("_proj_scale"):
+            yield name.removesuffix("_scale") + ".weight_offset", torch.zeros_like(value)
+
+
+@torch.inference_mode()
+def refresh_reloaded_weights(model):
+    for name, offset in model.named_parameters():
+        if name.endswith((".weight_offset", ".w13_weight_offset", ".w2_weight_offset")):
+            _validate_weight_offset(name, offset)
+    for module in model.modules():
+        for name in ("weight_scale", "w13_weight_scale"):
+            if (scale := getattr(module, f"{name}_fp32", None)) is not None:
+                scale.copy_(getattr(module, name))
+    model.process_weights_after_loading()
+
+
 def validate_runtime(vllm_config: VllmConfig) -> None:
     model = vllm_config.model_config
     config = model.hf_text_config
@@ -102,10 +132,23 @@ class AscendHYV4FlashForCausalLM(HYV4FlashForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         validate_runtime(vllm_config)
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._uses_symmetric_w8a8 = vllm_config.quant_config is not None
+
+    def prepare_checkpoint_weights(self, weights):
+        return _with_symmetric_weight_offsets(weights) if self._uses_symmetric_w8a8 else weights
+
+    def load_weights(self, weights):
+        # The VL wrapper processes the entire stream before splitting off the tower.
+        if self._weight_loading_depth == 0:
+            weights = self.prepare_checkpoint_weights(weights)
+        return super().load_weights(weights)
 
     def process_weights_after_loading(self):
         for layer in self.model.layers:
             layer.self_attn.prepare_kv_b_weight()
+
+    def process_weights_after_reload(self):
+        refresh_reloaded_weights(self)
 
     @staticmethod
     def get_mrope_input_positions(input_tokens, mm_features):

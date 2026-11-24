@@ -366,6 +366,8 @@ def get_quant_type_for_layer(
     prefix: str,
     packed_modules_mapping: dict[str, Any] | None = None,
     prefix_mapper: Callable[[str], str] | None = None,
+    *,
+    model_type: str | None = None,
 ) -> str | None:
     """Determine the quantization type for a layer.
 
@@ -374,6 +376,7 @@ def get_quant_type_for_layer(
         prefix: The layer prefix.
         packed_modules_mapping: Mapping for packed/fused modules.
         prefix_mapper: Map expanded module names to quantization description keys.
+        model_type: Model family for model-specific packed descriptions.
 
     Returns:
         The quantization type string (e.g., "W8A8_DYNAMIC").
@@ -384,6 +387,7 @@ def get_quant_type_for_layer(
 
     proj_name = prefix.split(".")[-1]
     if proj_name in packed_modules_mapping:
+        is_hy4_flash = model_type in ("hy_v4_flash", "hy_v4_flash_vl")
         quant_type = None
         # Replace only the trailing component; str.replace would also rewrite
         # any earlier occurrence of proj_name inside the prefix.
@@ -395,7 +399,7 @@ def get_quant_type_for_layer(
             shard_prefixes = [prefix_mapper(shard_prefix) for shard_prefix in shard_prefixes]
         shard_keys = [_find_quant_description_key(quant_description, shard_prefix) for shard_prefix in shard_prefixes]
         missing_v_shards = [
-            key is None and _is_missing_v_shard(shard_prefix + ".weight", quant_description)
+            not is_hy4_flash and key is None and _is_missing_v_shard(shard_prefix + ".weight", quant_description)
             for key, shard_prefix in zip(shard_keys, shard_prefixes)
         ]
         normal_keys = [key for key in shard_keys if key is not None]
@@ -412,6 +416,10 @@ def get_quant_type_for_layer(
                 raise KeyError(missing_normal_shards[0] + ".weight")
             fused_keys = _resolve_fused_packed_shard_keys(quant_description, prefix, shard_prefixes)
             if fused_keys is None:
+                if is_hy4_flash and (
+                    proj_name != "experts" or not any(key.startswith(prefix + ".") for key in quant_description)
+                ):
+                    return None
                 raise KeyError(missing_normal_shards[0] + ".weight")
             shard_keys_to_check = fused_keys
         else:
@@ -775,21 +783,15 @@ class AscendModelSlimConfig(QuantizationConfig):
             )
             self.packed_modules_mapping.update(mapping)
         if "experts" not in self.packed_modules_mapping:
-            shard_names: set[str] = set()
-            for key in self.quant_description:
-                m = re.search(r"\.experts\.\d+\.(\w+)\.weight$", key)
-                if m:
-                    shard_names.add(m.group(1))
-            if (
-                not shard_names
-                and model_type in ("hy_v4_flash", "hy_v4_flash_vl")
-                and any(
-                    key.endswith((".experts.gate_up_proj", ".experts.gate_up_proj.weight"))
-                    for key in self.quant_description
-                )
-            ):
-                # HYV4 Flash can keep the expert axis in packed gate/up and down tensors.
+            if model_type in ("hy_v4_flash", "hy_v4_flash_vl"):
+                # Check every logical shard even if the description is incomplete.
                 shard_names = {"gate_proj", "up_proj", "down_proj"}
+            else:
+                shard_names = {
+                    match.group(1)
+                    for key in self.quant_description
+                    if (match := re.search(r"\.experts\.\d+\.(\w+)\.weight$", key))
+                }
             if shard_names:
                 self.packed_modules_mapping["experts"] = [f"experts.0.{name}" for name in sorted(shard_names)]
 
@@ -803,6 +805,7 @@ class AscendModelSlimConfig(QuantizationConfig):
 
         vllm_config = get_current_vllm_config()
         model_type = vllm_config.model_config.hf_config.model_type
+        is_hy4_flash = model_type in ("hy_v4_flash", "hy_v4_flash_vl")
 
         if model_type in ["minimax", "minimax_m2"]:
             # Adapt to Minimax architecture: update layer names to MoE convention
@@ -833,8 +836,9 @@ class AscendModelSlimConfig(QuantizationConfig):
                 runtime_prefix,
                 self.packed_modules_mapping,
                 prefix_mapper=lambda name: self.quant_prefix_mapper(model_type, name),
+                model_type=model_type,
             )
-        if model_type in ("hy_v4_flash", "hy_v4_flash_vl") and quant_type not in (None, "W8A8_DYNAMIC"):
+        if is_hy4_flash and quant_type not in (None, "W8A8_DYNAMIC"):
             raise ValueError(f"HYV4 Flash on 910C does not support {quant_type} for {prefix}")
 
         if isinstance(layer, LinearBase):

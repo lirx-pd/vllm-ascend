@@ -249,6 +249,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             dtype=torch.bfloat16,
         )
 
+    @torch.inference_mode()
     def prepare_kv_b_weight(self):
         proj = self.kv_b_proj
         if proj.weight.dtype != torch.int8:
@@ -317,7 +318,8 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
     def _attend(self, meta, hidden, q_c, positions, query, wv, out):
         num_tokens = query.shape[0]
         indexer = self.indexer
-        uses_indexpool = indexer is not None and any(
+        cache_groups = indexer is not None and self.max_model_len > (indexer.budget + 1) * indexer.ratio
+        uses_indexpool = cache_groups and any(
             (length - 1) // indexer.ratio > indexer.budget for length in meta.seq_lens
         )
         if uses_indexpool:
@@ -330,11 +332,17 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 continue
             table = meta.block_table[request]
             pool = None
-            if uses_indexpool and (seq_len - 1) // indexer.ratio > indexer.budget:
-                # shortcut: recompute complete groups in eager mode, cache them when tuning decode latency.
-                complete = seq_len // indexer.ratio * indexer.ratio
-                history = torch.arange(complete, device=query.device)
-                pool = self._read_pool(table, history, positions.ndim)
+            if cache_groups:
+                ratio = indexer.ratio
+                context_len = seq_len - (stop - start)
+                first = context_len // ratio * ratio
+                complete = seq_len // ratio * ratio
+                if first < complete:
+                    history = torch.arange(first, complete, device=query.device)
+                    self._store_index_pool(table, history, positions.ndim)
+                if (seq_len - 1) // ratio > indexer.budget:
+                    group_ends = torch.arange(ratio - 1, complete, ratio, device=query.device)
+                    pool = self._read_pool(table, group_ends)
 
             for lo in range(start, stop, QUERY_CHUNK):
                 hi = min(lo + QUERY_CHUNK, stop)
@@ -363,8 +371,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             index_query, index_weight = indexer.encode_queries(
                 hidden[: query.shape[0]], q_c[: query.shape[0]], positions[..., : query.shape[0]]
             )
-            complete = max_context // indexer.ratio * indexer.ratio
-            history = torch.arange(complete, device=query.device)
+            ratio = indexer.ratio
+            offsets = torch.arange(ratio, device=query.device)
+            group_ends = torch.arange(ratio - 1, max_context, ratio, device=query.device)
         for request in range(query.shape[0]):
             row = slice(request, request + 1)
             table = meta.block_table[request]
@@ -372,13 +381,12 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             if indexer is None:
                 candidates = window_candidates(visible, min(self.window, max_context))
             elif score_groups:
-                # shortcut: recompute the pool at the captured context bound, cache groups when tuning decode latency.
-                # Only causally complete groups may contribute. Read safe
-                # slots for the fixed-shape tail and mask the corresponding scores.
-                end = (visible + 1) // indexer.ratio * indexer.ratio
-                pool = self._read_pool(table, history.masked_fill(history >= end, 0), positions.ndim)
+                closes_group = (visible >= 0) & ((visible + 1) % ratio == 0)
+                group = visible + 1 - ratio + offsets
+                self._store_index_pool(table, group.masked_fill(~closes_group, 0), positions.ndim, closes_group)
+                pool = self._read_pool(table, group_ends.masked_fill(group_ends > visible, 0))
                 candidates = sparse_candidates(
-                    index_query[row], index_weight[row], pool, visible, indexer.ratio, indexer.budget
+                    index_query[row], index_weight[row], pool, visible, ratio, indexer.budget
                 )
                 dense = torch.arange(candidates.shape[-1], device=query.device).unsqueeze(0)
                 dense = dense.masked_fill(dense > visible[:, None], -1)
@@ -388,11 +396,29 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 candidates = candidates.masked_fill(candidates > visible[:, None], -1)
             self._attend_rows(table, candidates, query[row], wv, out[row])
 
-    def _read_pool(self, table, history, position_ndim):
-        rows = self._gather(table, history)[:, self.kv_width :]
-        keys = rows[:, :INDEX_DIM]
-        coords = rows[:, INDEX_DIM:].contiguous().view(torch.int64)
-        return self.indexer.encode_keys(keys, coords[:, 0] if position_ndim == 1 else coords.T)
+    def _store_index_pool(self, table, positions, position_ndim, valid=None):
+        ratio = self.indexer.ratio
+        cache = self.kv_cache.view(-1, self.cache_width)
+        slots = self._cache_slots(table, positions)
+        rows = cache.index_select(0, slots)
+        position_start = self.kv_width + INDEX_DIM
+        coords = rows[:, position_start:].contiguous().view(torch.int64)
+        keys = self.indexer.encode_keys(
+            rows[:, self.kv_width : position_start], coords[:, 0] if position_ndim == 1 else coords.T
+        )
+        # The terminal token owns the summary even when a prefix shares earlier pages.
+        # Power-of-two scaled E4M3 values fit exactly in the BF16 key lanes.
+        terminal = rows[ratio - 1 :: ratio]
+        updated = torch.cat((terminal[:, : self.kv_width], keys.to(rows.dtype), terminal[:, position_start:]), dim=-1)
+        slots = slots[ratio - 1 :: ratio]
+        if valid is not None:
+            slots = slots.masked_fill(~valid, 0)
+            updated = torch.where(valid[:, None], updated, cache[:1])
+        cache.index_copy_(0, slots, updated)
+
+    def _read_pool(self, table, group_ends):
+        rows = self._gather(table, group_ends)
+        return rows[:, self.kv_width : self.kv_width + INDEX_DIM].float()
 
     def _attend_rows(self, table, candidates, query, wv, out):
         kv = self._gather(table, candidates.clamp_min(0))[..., : self.kv_width]
@@ -402,10 +428,13 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         value = torch.bmm(context.transpose(0, 1).contiguous(), wv).transpose(0, 1)
         out.copy_(value.reshape_as(out))
 
-    def _gather(self, block_table, positions):
-        cache = self.kv_cache
-        block_size = cache.shape[2]
+    def _cache_slots(self, block_table, positions):
+        block_size = self.kv_cache.shape[2]
         pages = (positions // block_size).flatten()
         blocks = block_table.index_select(0, pages).long()
-        slots = blocks * block_size + positions.flatten() % block_size
+        return blocks * block_size + positions.flatten() % block_size
+
+    def _gather(self, block_table, positions):
+        cache = self.kv_cache
+        slots = self._cache_slots(block_table, positions)
         return cache.view(-1, self.cache_width).index_select(0, slots).view(*positions.shape, self.cache_width)

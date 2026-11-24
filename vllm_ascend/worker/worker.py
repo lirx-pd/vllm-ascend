@@ -445,8 +445,9 @@ class NPUWorker(WorkerBase):
 
         assert self.weight_transfer_engine is not None
         self.weight_transfer_engine.finish_weight_update()
-        self.model_runner.reset_lora_state()
         self._weight_update_active = False
+        self._process_weights_after_reload()
+        self.model_runner.reset_lora_state()
 
     def shutdown(self) -> None:
         state = getattr(getattr(self, "model_runner", None), "eplb_state", None)
@@ -1473,6 +1474,12 @@ class NPUWorker(WorkerBase):
 
     def reload_weights(self, *args, **kwargs) -> None:
         self.model_runner.reload_weights(*args, **kwargs)
+        self._process_weights_after_reload()
+
+    def _process_weights_after_reload(self) -> None:
+        process = getattr(self.get_model(), "process_weights_after_reload", None)
+        if callable(process):
+            process()
 
     def check_health(self) -> None:
         import subprocess

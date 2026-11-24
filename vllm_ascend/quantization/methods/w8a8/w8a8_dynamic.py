@@ -57,6 +57,18 @@ def scale_from_float_to_int64(scale):
     return scale
 
 
+@torch.inference_mode()
+def _prepare_fp32_weight_scale(layer, name):
+    scale = getattr(layer, name).data
+    cache_name = f"{name}_fp32"
+    cached = getattr(layer, cache_name, None)
+    if cached is None or cached.shape != scale.shape or cached.device != scale.device:
+        setattr(layer, cache_name, scale.to(torch.float32))
+    else:
+        # A layerwise reload must preserve the address captured by the graph.
+        cached.copy_(scale)
+
+
 @register_scheme("W8A8_DYNAMIC", "linear")
 class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
     """Linear method for Ascend W8A8_DYNAMIC.
@@ -139,7 +151,7 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
         if self.act_quant_type == torch.int8 and not getattr(layer, "_fused_preprocess_managed", False):
             layer.weight.data = maybe_trans_nz(layer.weight.data)
         layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
+        _prepare_fp32_weight_scale(layer, "weight_scale")
         layer.weight_offset.data = layer.weight_offset.data.flatten()
 
 
@@ -285,7 +297,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
             layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(layer.w13_weight_scale.data.shape[0], -1)
-        layer.w13_weight_scale_fp32 = layer.w13_weight_scale.data.to(torch.float32)
+        _prepare_fp32_weight_scale(layer, "w13_weight_scale")
         layer.w13_weight_offset.data = layer.w13_weight_offset.data.view(layer.w13_weight_offset.data.shape[0], -1)
         layer.w2_weight_scale.data = layer.w2_weight_scale.data.view(layer.w2_weight_scale.data.shape[0], -1)
         layer.w2_weight_offset.data = layer.w2_weight_offset.data.view(layer.w2_weight_offset.data.shape[0], -1)

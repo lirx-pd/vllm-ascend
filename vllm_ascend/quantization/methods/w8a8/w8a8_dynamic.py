@@ -531,11 +531,42 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         dispose_tensor(mlp_compute_input.hidden_states)
         return hidden_states, swiglu_out_scale
 
+    def _gmm_fp32_scales(self, inputs, x, weight, scales, token_scale):
+        # A3 NZ GMM cannot combine FP32 per-channel scales with BF16 output.
+        # Keep the integer accumulator until both scales have been applied.
+        groups = inputs.group_list
+        accum = torch_npu.npu_grouped_matmul(
+            x=[x],
+            weight=weight if isinstance(weight, list) else [weight],
+            group_list=groups,
+            group_list_type=inputs.group_list_type,
+            group_type=0,
+            split_item=2,
+            output_dtype=torch.int32,
+        )[0]
+        if groups.numel() == 0:
+            return torch.zeros_like(accum, dtype=self.in_dtype)
+        ends = groups[:, 1].cumsum(0) if inputs.group_list_type == 2 else cumsum_group_list(
+            groups, inputs.group_list_type, 0
+        )
+        rows = torch.arange(x.shape[0], device=x.device, dtype=ends.dtype)
+        group = torch.searchsorted(ends.contiguous(), rows, right=True)
+        valid = group < ends.numel()
+        group = group.clamp_max(ends.numel() - 1)
+        expert = groups[:, 0].index_select(0, group) if inputs.group_list_type == 2 else group
+        weight_scale = scales[0] if len(scales) == 1 else torch.stack(scales)
+        output = accum.float() * weight_scale.view(-1, accum.shape[-1]).index_select(0, expert.long())
+        return (output * token_scale.reshape(-1, 1)).masked_fill(~valid[:, None], 0).to(self.in_dtype)
+
     def apply_gmm1(self, mlp_compute_input: MoEMlpComputeInput):
         hidden_states = mlp_compute_input.hidden_states
         hidden_states, pertoken_scale = self._quant_hidden_states(hidden_states, mlp_compute_input.dynamic_scale)
         layer = mlp_compute_input.layer
         w1, w1_scale, _, w2_scale = self._get_mlp_weights(layer)
+        if self.weight_scale_dtype == torch.float32:
+            result = self._gmm_fp32_scales(mlp_compute_input, hidden_states, w1, w1_scale, pertoken_scale)
+            dispose_tensor(mlp_compute_input.hidden_states)
+            return result
         w2_scale_dtype = w2_scale[0].dtype
         # w1 may be a per-expert weight list (MRv2 EPLB: use_expert_weight_list),
         # then scales must be per-expert too — aclnn grouped_matmul requires
@@ -551,7 +582,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             group_type=0,
             group_list=mlp_compute_input.group_list,
             group_list_type=mlp_compute_input.group_list_type,
-            output_dtype=self.in_dtype if self.weight_scale_dtype else w2_scale_dtype,
+            output_dtype=w2_scale_dtype,
         )[0]
         dispose_tensor(mlp_compute_input.hidden_states)
         return hidden_states
@@ -561,6 +592,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
 
     def apply_gmm2(self, mlp_compute_input: MoEMlpComputeInput, hidden_states, act_out_scale):
         _, _, w2, w2_scale = self._get_mlp_weights(mlp_compute_input.layer)
+        if self.weight_scale_dtype == torch.float32:
+            return self._gmm_fp32_scales(mlp_compute_input, hidden_states, w2, w2_scale, act_out_scale)
         return torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=w2,
@@ -571,5 +604,5 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             group_list_type=mlp_compute_input.group_list_type,
             group_type=0,
             group_list=mlp_compute_input.group_list,
-            output_dtype=self.in_dtype if self.weight_scale_dtype else w2_scale[0].dtype,
+            output_dtype=w2_scale[0].dtype,
         )[0]

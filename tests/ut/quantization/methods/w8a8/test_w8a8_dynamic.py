@@ -159,6 +159,21 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
             self.assertEqual(params[f"{name}_weight_scale"].dtype, torch.float32)
             self.assertEqual(params[f"{name}_weight_offset"].dtype, torch.bfloat16)
 
+    @patch("torch_npu.npu_grouped_matmul")
+    def test_dequantize_with_fp32_expert_scales(self, gmm):
+        accum = torch.tensor([[31, -503], [511, -93], [98, 257], [1, 1]], dtype=torch.int32)
+        gmm.return_value = [accum]
+        scales = torch.tensor([[0.1003, 2.001], [17., 13.], [1.093, 0.3002]])
+        token_scale = torch.tensor([0.17, 0.21, 0.33, 1.0])
+        self.quant_method.in_dtype = torch.bfloat16
+        expected = (accum.float() * scales[[0, 2, 2, 0]] * token_scale[:, None]).bfloat16()
+        expected[-1].zero_()
+        for group_type, groups in [(0, [1, 1, 3]), (1, [1, 0, 2]), (2, [[0, 1], [2, 2]])]:
+            inputs = SimpleNamespace(group_list=torch.tensor(groups), group_list_type=group_type)
+            result = self.quant_method._gmm_fp32_scales(inputs, accum, [], [scales], token_scale)
+            self.assertEqual(gmm.call_args.kwargs["output_dtype"], torch.int32)
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
     def test_get_dynamic_quant_param_various_sizes(self):
         param_dict = self.quant_method.get_dynamic_quant_param(
             self.num_experts, self.intermediate_size, self.hidden_size, torch.bfloat16

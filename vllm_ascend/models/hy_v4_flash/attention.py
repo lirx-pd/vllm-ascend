@@ -4,6 +4,7 @@
 from dataclasses import dataclass
 
 import torch
+import torch_npu
 from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -547,9 +548,41 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         else:
             kv = self._gather(table, candidates.clamp_min(0))[..., : self.kv_width]
             kv = kv.masked_fill(candidates[..., None] < 0, 0)
-        probs = mla_attention_probs(query, kv, candidates, self.learnable_sink_param, self.scale)
-        context = torch.bmm(probs, kv[..., : self.latent_dim].float()).to(query.dtype)
+        if (
+            fused_gather
+            and query.dtype == torch.bfloat16
+            and (self.latent_dim, self.rope_dim) == (512, 64)
+            and query.shape[1] in (4, 8)
+        ):
+            context = self._fused_decode_mla(query, kv, candidates)
+        else:
+            probs = mla_attention_probs(query, kv, candidates, self.learnable_sink_param, self.scale)
+            context = torch.bmm(probs, kv[..., : self.latent_dim].float()).to(query.dtype)
         self._project_values(context, wv, out)
+
+    def _fused_decode_mla(self, query, kv, candidates):
+        query, query_rope = (part.unsqueeze(2).contiguous() for part in query.split((512, 64), dim=-1))
+        key, key_rope = (part.unsqueeze(1).contiguous() for part in kv.split((512, 64), dim=-1))
+        mask = (candidates < 0)[:, None, None, :]
+        context, lse = torch_npu.npu_fused_infer_attention_score_v2(
+            query,
+            key,
+            key,
+            query_rope=query_rope,
+            key_rope=key_rope,
+            atten_mask=mask,
+            num_query_heads=query.shape[1],
+            num_key_value_heads=1,
+            softmax_scale=self.scale,
+            input_layout="BNSD",
+            sparse_mode=0,
+            return_softmax_lse=True,
+        )
+        # D=512 MLA returns LSE. The zero-valued sink only changes the denominator.
+        sink = self.learnable_sink_param.view(1, -1, 1)
+        weight = (lse.squeeze(2) - sink).sigmoid()
+        context = (context.squeeze(2).float() * weight).to(query.dtype)
+        return context.masked_fill(mask.all(dim=-1), 0)
 
     @staticmethod
     def _project_values(context, wv, out):

@@ -249,19 +249,16 @@ class FlashEngram(nn.Module):
         local_hashes = hashes[:, local.head_start : local.head_end]
         x = rows.masked_fill(local_hashes.unsqueeze(-1) < 0, 0)
         x = (x * (x.square().mean(-1, keepdim=True) + eps).rsqrt() * gamma).to(hidden.dtype).flatten(1)
+        projections = torch.stack([proj(x) for proj in self.key_projs] + [self.value_proj(x)])
+        if local.tp_size > 1:
+            projections = tensor_model_parallel_all_reduce(projections)
         gates = []
-        for channel in range(self.hc_mult):
-            key = self.key_projs[channel](x)
-            if local.tp_size > 1:
-                key = tensor_model_parallel_all_reduce(key)
+        for channel, key in enumerate(projections[:-1]):
             gate = (self.norm_key[channel](key) * self.norm_query[channel](hidden[:, channel])).sum(-1)
             gate = gate * self.hidden_size**-0.5
             gates.append((gate.abs().clamp_min(1e-6).sqrt() * gate.sign()).sigmoid())
         gate = torch.stack(gates, dim=1)
-        value = self.value_proj(x)
-        if local.tp_size > 1:
-            value = tensor_model_parallel_all_reduce(value)
-        value = value.float()
+        value = projections[-1].float()
         signal = self.unified_pre_gamma.float() * value * (value.square().mean(-1, keepdim=True) + eps).rsqrt()
         scales = torch.stack(list(self.unified_per_hc_scales)).float()
         result = ((gate.float().unsqueeze(-1) + scales) * signal.unsqueeze(1)).to(hidden.dtype)

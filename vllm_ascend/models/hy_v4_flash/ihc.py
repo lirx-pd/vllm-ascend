@@ -2,8 +2,66 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
-from vllm.models.hy_v4.nvidia.hc import HYV4HCLayer
+from vllm import envs
+from vllm.models.hy_v4.nvidia.hc import HYV4HCLayer, HYV4HCPreLayer
+from vllm.models.hy_v4.nvidia.triton_ihc import _ihc_pre_stage1, _ihc_pre_stage2
 from vllm.triton_utils import HAS_TRITON, tl, triton
+
+
+class AscendHYV4FlashHCPreLayer(HYV4HCPreLayer):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        tokens, channels, hidden = x.shape
+        if not (
+            HAS_TRITON
+            and not envs.VLLM_BATCH_INVARIANT
+            and x.device.type == "npu"
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and self.hc_fn.weight.is_contiguous()
+            and 0 < tokens <= 16
+            and (channels, hidden) == (4, 3072)
+        ):
+            return super().forward(x)
+
+        tile = 1024
+        width = channels * hidden
+        splits = width // tile
+        partial_stride = 1 + 2 * channels
+        partial = torch.empty((tokens, splits, partial_stride), device=x.device, dtype=torch.float32)
+        output = x.new_empty((tokens, hidden))
+        post = partial.new_empty((tokens, channels))
+        _ihc_pre_stage1[(tokens, splits)](
+            x,
+            self.hc_fn.weight,
+            partial,
+            width,
+            channels,
+            channels,
+            splits,
+            tile,
+            partial_stride,
+            enable_fp_fusion=False,
+        )
+        _ihc_pre_stage2[(tokens, hidden // tile)](
+            x,
+            partial,
+            self.hc_scale,
+            self.hc_base,
+            output,
+            post,
+            hidden,
+            width,
+            channels,
+            channels,
+            splits,
+            partial_stride,
+            tile,
+            self.magnitude,
+            self.layernorm_epsilon,
+            self.hc_eps,
+            enable_fp_fusion=False,
+        )
+        return output, post
 
 
 @triton.jit
@@ -20,6 +78,8 @@ def _ihc_post_kernel(hidden, residual, gates, output, HIDDEN: tl.constexpr, CHAN
 
 
 class AscendHYV4FlashHCLayer(HYV4HCLayer):
+    pre_layer_cls = AscendHYV4FlashHCPreLayer
+
     def post(self, output_with_bias, residual, post_gates):
         if (
             HAS_TRITON

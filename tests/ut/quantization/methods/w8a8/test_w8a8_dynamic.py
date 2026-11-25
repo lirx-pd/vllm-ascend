@@ -28,6 +28,13 @@ class TestAscendW8A8DynamicLinearMethod(TestBase):
             self.assertEqual(weight["weight"].dtype, torch.int8)
             self.assertEqual(weight["weight"].shape, (output_size, input_size))
 
+    def test_fp32_scale_keeps_checkpoint_precision(self):
+        self.method.weight_scale_dtype = torch.float32
+        params = self.method.get_perchannel_param(1, torch.bfloat16)
+        params["weight_scale"].fill_(1.003)
+        self.assertEqual(params["weight_scale"].item(), torch.tensor(1.003).item())
+        self.assertEqual(params["weight_offset"].dtype, torch.bfloat16)
+
     def test_get_perchannel_param_dtype_variations(self):
         dtypes = [torch.bfloat16, torch.float16]
         for dtype in dtypes:
@@ -144,6 +151,13 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
             )
             self.assertEqual(param_dict["w13_weight"].shape[0], num_experts)
             self.assertEqual(param_dict["w2_weight"].shape[0], num_experts)
+
+    def test_fp32_expert_scales(self):
+        self.quant_method.weight_scale_dtype = torch.float32
+        params = self.quant_method.get_dynamic_quant_param(2, 4, 8, torch.bfloat16)
+        for name in ("w13", "w2"):
+            self.assertEqual(params[f"{name}_weight_scale"].dtype, torch.float32)
+            self.assertEqual(params[f"{name}_weight_offset"].dtype, torch.bfloat16)
 
     def test_get_dynamic_quant_param_various_sizes(self):
         param_dict = self.quant_method.get_dynamic_quant_param(

@@ -258,6 +258,9 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             quant_config=quant,
             prefix=f"{prefix}.q_b_proj",
         )
+        # The A5 target keeps the second layer's query projection in BF16.
+        self.q_b_proj._fused_preprocess_managed = layer_idx == 1
+        self.register_buffer("_q_b_dense_weight", None, persistent=False)
         self.kv_b_proj = ColumnParallelLinear(
             self.latent_dim,
             heads * (self.nope_dim + self.v_dim),
@@ -304,20 +307,28 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
 
     @torch.inference_mode()
     def prepare_kv_b_weight(self):
-        proj = self.kv_b_proj
+        self._prepare_dense_projection(self.kv_b_proj, "_kv_b_dense_weight")
+        if getattr(getattr(self, "q_b_proj", None), "_fused_preprocess_managed", False):
+            self._prepare_dense_projection(self.q_b_proj, "_q_b_dense_weight")
+
+    def _prepare_dense_projection(self, proj, name):
         if proj.weight.dtype != torch.int8:
             return
-        # ModelSlim's post-load INT8 weights are [in, out], with one scale per
-        # output channel. Restore the dense [out, in] MLA projection once.
         weight = (proj.weight.T.float() * proj.weight_scale.float().reshape(-1, 1)).to(proj.params_dtype)
-        if self._kv_b_dense_weight is None:
-            self._kv_b_dense_weight = weight.contiguous()
+        cached = getattr(self, name)
+        if cached is None:
+            setattr(self, name, weight.contiguous())
         else:
-            self._kv_b_dense_weight.copy_(weight)
+            cached.copy_(weight)
 
     def forward(self, positions, hidden_states):
         q_c = self.q_a_layernorm(self.q_a_proj(hidden_states)[0])
-        q = self.q_b_proj(q_c)[0].reshape(-1, self.local_heads, self.nope_dim + self.rope_dim)
+        q = (
+            self.q_b_proj(q_c)[0]
+            if self._q_b_dense_weight is None
+            else torch.nn.functional.linear(q_c, self._q_b_dense_weight)
+        )
+        q = q.reshape(-1, self.local_heads, self.nope_dim + self.rope_dim)
         kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split((self.latent_dim, self.rope_dim), -1)
         kv_c = self.kv_a_layernorm(kv_c)
         q_nope, q_pe = q.split((self.nope_dim, self.rope_dim), dim=-1)
@@ -380,6 +391,16 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
             index_query, index_weight = indexer.encode_queries(
                 hidden[:num_tokens], q_c[:num_tokens], positions[..., :num_tokens]
             )
+        if cache_groups:
+            # A short request can reuse pages populated by a later request in this batch.
+            ratio = indexer.ratio
+            for request, seq_len in enumerate(meta.seq_lens):
+                start, stop = meta.query_start_loc[request : request + 2]
+                first = (seq_len - (stop - start)) // ratio * ratio
+                complete = seq_len // ratio * ratio
+                if start < stop and first < complete:
+                    history = torch.arange(first, complete, device=query.device)
+                    self._store_index_pool(meta.block_table[request], history, positions.ndim)
         for request, seq_len in enumerate(meta.seq_lens):
             start, stop = meta.query_start_loc[request : request + 2]
             if start == stop:
@@ -389,15 +410,6 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 indexer is None or seq_len <= INDEXPOOL_PREFILL_MAX_KV_RATIO * candidate_width
             )
             pool = None
-            if cache_groups:
-                ratio = indexer.ratio
-                context_len = seq_len - (stop - start)
-                first = context_len // ratio * ratio
-                complete = seq_len // ratio * ratio
-                if first < complete:
-                    history = torch.arange(first, complete, device=query.device)
-                    self._store_index_pool(table, history, positions.ndim)
-
             key_start = 0
             request_kv = None
             rows = None
@@ -415,6 +427,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
                 request_kv = (key, key[:, : self.latent_dim].contiguous())
 
             if cache_groups and (seq_len - 1) // ratio > indexer.budget:
+                complete = seq_len // ratio * ratio
                 if rows is not None:
                     pool = rows[ratio - 1 : complete : ratio, self.kv_width : self.kv_width + INDEX_DIM].float()
                     scores_per_query = pool.shape[0] * indexer.num_heads

@@ -173,6 +173,26 @@ def test_paged_prefill_and_decode_match_uninterrupted_attention(ratio, batched_p
     if ratio is not None:
         assert pool_batches == [2 * ratio] * 3
 
+    if ratio == 2:
+        # The follower consumes three pages being produced by the second request in this same batch.
+        layer.kv_cache.zero_()
+        table[0, :3] = table[1, :3]
+        raw = layer.indexer.token_key_norm(hidden[1, :6])
+        expected = encode_keys(raw, coordinates[:, :6])
+        read_pool = layer._read_pool
+        reads = []
+
+        def check_shared_pool(block_table, group_ends):
+            keys = read_pool(block_table, group_ends)
+            if not reads:
+                torch.testing.assert_close(keys, expected, rtol=0, atol=0)
+            reads.append(keys)
+            return keys
+
+        monkeypatch.setattr(layer, "_read_pool", check_shared_pool)
+        run([6, 0], [7, 6])
+        assert reads
+
     if ratio == 3:
         # Two requests share the first page and diverge before this group closes.
         layer.kv_cache.zero_()
@@ -253,7 +273,16 @@ def test_quantized_kv_b_weight_restores_out_in_layout_and_keeps_address():
         weight_scale=torch.tensor([0.5, 2.0, 0.25], dtype=torch.bfloat16),
         params_dtype=torch.bfloat16,
     )
+    layer.register_buffer("_q_b_dense_weight", None, persistent=False)
+    layer.q_b_proj = SimpleNamespace(
+        weight=layer.kv_b_proj.weight,
+        weight_scale=torch.tensor([1.003, 0.999, 1.001], dtype=torch.float32),
+        params_dtype=torch.bfloat16,
+        _fused_preprocess_managed=True,
+    )
     layer.prepare_kv_b_weight()
+    expected_q = (layer.q_b_proj.weight.T.float() * layer.q_b_proj.weight_scale[:, None]).bfloat16()
+    torch.testing.assert_close(layer._q_b_dense_weight, expected_q, rtol=0, atol=0)
     weight = layer._kv_b_dense_weight
     expected = torch.tensor([[0.5, -1], [6, 8], [1.25, -1.5]], dtype=torch.bfloat16)
     torch.testing.assert_close(weight, expected)

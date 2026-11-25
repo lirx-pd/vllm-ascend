@@ -77,6 +77,7 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
     and per-channel quantization for weights.
     """
 
+    weight_scale_dtype: torch.dtype | None = None
     act_quant_type: torch.dtype = torch.int8
     weight_switch_gather_specs = (WeightSwitchGatherSpec("weight"),)
     weight_switch_output_gather_specs = (
@@ -99,7 +100,7 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
         params_dict = {}
-        params_dict["weight_scale"] = torch.empty(output_size, 1, dtype=params_dtype)
+        params_dict["weight_scale"] = torch.empty(output_size, 1, dtype=self.weight_scale_dtype or params_dtype)
         params_dict["weight_offset"] = torch.empty(output_size, 1, dtype=params_dtype)
         return params_dict
 
@@ -162,6 +163,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
     supports_eplb = True
     # Declare the quantization type for this scheme
     quant_type: QuantType = QuantType.W8A8
+    weight_scale_dtype: torch.dtype | None = None
     act_quant_type: torch.dtype = torch.int8
     fused_activations = frozenset({"silu", "swigluoai_uninterleave"})
 
@@ -202,13 +204,14 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
         param_dict = {}
+        scale_dtype = self.weight_scale_dtype or params_dtype
         param_dict["w13_weight_scale"] = torch.empty(
-            num_experts, 2 * intermediate_size_per_partition, 1, dtype=params_dtype
+            num_experts, 2 * intermediate_size_per_partition, 1, dtype=scale_dtype
         )
         param_dict["w13_weight_offset"] = torch.empty(
             num_experts, 2 * intermediate_size_per_partition, 1, dtype=params_dtype
         )
-        param_dict["w2_weight_scale"] = torch.empty(num_experts, hidden_sizes, 1, dtype=params_dtype)
+        param_dict["w2_weight_scale"] = torch.empty(num_experts, hidden_sizes, 1, dtype=scale_dtype)
         param_dict["w2_weight_offset"] = torch.empty(num_experts, hidden_sizes, 1, dtype=params_dtype)
         return param_dict
 
@@ -548,7 +551,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             group_type=0,
             group_list=mlp_compute_input.group_list,
             group_list_type=mlp_compute_input.group_list_type,
-            output_dtype=w2_scale_dtype,
+            output_dtype=self.in_dtype if self.weight_scale_dtype else w2_scale_dtype,
         )[0]
         dispose_tensor(mlp_compute_input.hidden_states)
         return hidden_states
@@ -568,5 +571,5 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             group_list_type=mlp_compute_input.group_list_type,
             group_type=0,
             group_list=mlp_compute_input.group_list,
-            output_dtype=w2_scale[0].dtype,
+            output_dtype=self.in_dtype if self.weight_scale_dtype else w2_scale[0].dtype,
         )[0]

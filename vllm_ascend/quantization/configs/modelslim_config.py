@@ -849,6 +849,8 @@ class AscendModelSlimConfig(QuantizationConfig):
                 logger.debug("Select AscendUnquantizedLinearMethod for %s (layer=%s)", prefix, "LinearBase")
                 return AscendUnquantizedLinearMethod()
             scheme = create_scheme_for_layer(quant_type, prefix, "linear")
+            if is_hy4_flash and quant_type == "W8A8_DYNAMIC":
+                scheme.weight_scale_dtype = torch.float32
             logger.debug("Select AscendLinearMethod for %s (layer=%s)", prefix, "LinearBase")
             return AscendLinearMethod(scheme)
 
@@ -900,6 +902,8 @@ class AscendModelSlimConfig(QuantizationConfig):
             # registered MoE parameter receives the mapped loader.
             layer.weight_loader = _make_modelslim_moe_weight_loader(layer.weight_loader)
             scheme = create_scheme_for_layer(quant_type, prefix, "moe")
+            if is_hy4_flash and quant_type == "W8A8_DYNAMIC":
+                scheme.weight_scale_dtype = torch.float32
             logger.debug("Select AscendFusedMoEMethod for %s (layer=%s)", prefix, "FusedMoE")
             return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid)
         elif isinstance(layer, VocabParallelEmbedding):

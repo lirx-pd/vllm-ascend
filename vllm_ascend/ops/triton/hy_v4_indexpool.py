@@ -43,6 +43,9 @@ def _gather_paged_rows_kernel(
     positions,
     output,
     ROWS: tl.constexpr,
+    ROWS_PER_REQUEST: tl.constexpr,
+    TABLE_ROW_STRIDE: tl.constexpr,
+    TABLE_PAGE_STRIDE: tl.constexpr,
     CACHE_WIDTH: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     COLUMN: tl.constexpr,
@@ -55,7 +58,8 @@ def _gather_paged_rows_kernel(
     position = tl.load(positions + row, row < ROWS, other=-1).to(tl.int32)
     live = position >= 0
     position = tl.maximum(position, 0)
-    page = tl.load(block_table + position // PAGE_SIZE, live, other=0).to(tl.int64)
+    page_index = (row // ROWS_PER_REQUEST) * TABLE_ROW_STRIDE + (position // PAGE_SIZE) * TABLE_PAGE_STRIDE
+    page = tl.load(block_table + page_index, live, other=0).to(tl.int64)
     slot = page * PAGE_SIZE + position % PAGE_SIZE
     values = tl.load(
         cache + slot[:, None] * CACHE_WIDTH + COLUMN + col[None, :],
@@ -77,7 +81,7 @@ def gather_paged_rows(
     width: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Read just the requested cache field and zero masked positions."""
+    """Read cache fields from one page table or one table per request."""
     rows = positions.numel()
     tile_rows = 32 if width <= 128 else 16
     result = torch.empty((*positions.shape, width), dtype=dtype, device=cache.device)
@@ -87,6 +91,9 @@ def gather_paged_rows(
         positions,
         result,
         rows,
+        positions.shape[-1],
+        block_table.stride(0) if block_table.ndim == 2 else 0,
+        block_table.stride(-1),
         cache.shape[-1],
         cache.shape[2],
         column,

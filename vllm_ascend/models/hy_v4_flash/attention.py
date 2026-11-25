@@ -42,6 +42,9 @@ INDEXPOOL_PREFILL_MAX_KV_RATIO = 8
 # At most 64 MiB for each FP32 IndexPool per-head score temporary.
 INDEXPOOL_PREFILL_SCORE_ELEMENTS = 16 * 1024 * 1024
 INDEXPOOL_FUSED_MAX_ROWS = 16
+FIA_BATCHED_KV_LIMIT = 512
+FIA_LONG_KV_LIMIT = 2048
+FIA_LONG_KV_MAX_BATCH = 4
 POSITION_AXES = 3
 POSITION_LANES = POSITION_AXES * torch.int64.itemsize // torch.bfloat16.itemsize
 
@@ -471,52 +474,40 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         self._project_values(context, wv, out)
 
     def _attend_decode_graph(self, meta, hidden, q_c, positions, query, wv, out):
-        seq_lens = meta.decode_seq_lens
+        num_tokens = query.shape[0]
         # The 910C runner captures one target query per request.
-        live = meta.slot_mapping[: query.shape[0]] >= 0
-        logical = (seq_lens.long() - 1).masked_fill(~live, -1)
-        max_context = min(self.max_model_len, meta.block_table.shape[-1] * self.kv_cache.shape[2])
+        live = meta.slot_mapping[:num_tokens] >= 0
+        logical = (meta.decode_seq_lens[:num_tokens].long() - 1).masked_fill(~live, -1)
+        table = meta.block_table[:num_tokens]
+        max_context = min(self.max_model_len, table.shape[-1] * self.kv_cache.shape[2])
         indexer = self.indexer
         fused_gather = HAS_TRITON and query.device.type == "npu"
-        score_groups = indexer is not None and max_context > (indexer.budget + 1) * indexer.ratio
-        if score_groups:
+        if indexer is None:
+            candidates = window_candidates(logical, min(self.window, max_context))
+        elif max_context > (indexer.budget + 1) * indexer.ratio:
             index_query, index_weight = indexer.encode_queries(
-                hidden[: query.shape[0]], q_c[: query.shape[0]], positions[..., : query.shape[0]]
+                hidden[:num_tokens], q_c[:num_tokens], positions[..., :num_tokens]
             )
             ratio = indexer.ratio
             offsets = torch.arange(ratio, device=query.device)
+            visible = logical[:, None]
+            closes_group = (logical >= 0) & ((logical + 1) % ratio == 0)
+            group = visible + 1 - ratio + offsets
+            self._store_index_pool(table, group.masked_fill(~closes_group[:, None], 0), positions.ndim, closes_group)
             group_ends = torch.arange(ratio - 1, max_context, ratio, device=query.device)
-        for request in range(query.shape[0]):
-            row = slice(request, request + 1)
-            table = meta.block_table[request]
-            visible = logical[row]
-            if indexer is None:
-                candidates = window_candidates(visible, min(self.window, max_context))
-            elif score_groups:
-                closes_group = (visible >= 0) & ((visible + 1) % ratio == 0)
-                group = visible + 1 - ratio + offsets
-                self._store_index_pool(table, group.masked_fill(~closes_group, 0), positions.ndim, closes_group)
-                if fused_gather:
-                    pool = gather_paged_rows(
-                        self.kv_cache,
-                        table,
-                        group_ends.masked_fill(group_ends > visible, -1),
-                        self.kv_width,
-                        INDEX_DIM,
-                        torch.float32,
-                    )
-                else:
-                    pool = self._read_pool(table, group_ends.masked_fill(group_ends > visible, 0))
-                candidates = sparse_candidates(
-                    index_query[row], index_weight[row], pool, visible, ratio, indexer.budget
-                )
-                dense = torch.arange(candidates.shape[-1], device=query.device).unsqueeze(0)
-                dense = dense.masked_fill(dense > visible[:, None], -1)
-                candidates = torch.where((visible // indexer.ratio > indexer.budget)[:, None], candidates, dense)
+            pool_positions = group_ends.expand(num_tokens, -1).masked_fill(group_ends > visible, -1)
+            if fused_gather:
+                pool = gather_paged_rows(self.kv_cache, table, pool_positions, self.kv_width, INDEX_DIM, torch.float32)
             else:
-                candidates = torch.arange(max_context, device=query.device).unsqueeze(0)
-                candidates = candidates.masked_fill(candidates > visible[:, None], -1)
-            self._attend_rows(table, candidates, query[row], wv, out[row], fused_gather=fused_gather)
+                pool = self._read_pool(table, pool_positions.clamp_min(0))
+            candidates = sparse_candidates(index_query, index_weight, pool, logical, ratio, indexer.budget)
+            dense = torch.arange(candidates.shape[-1], device=query.device)
+            dense = dense.expand(num_tokens, -1).masked_fill(dense > visible, -1)
+            candidates = torch.where(visible // ratio > indexer.budget, candidates, dense)
+        else:
+            dense = torch.arange(max_context, device=query.device)
+            candidates = dense.expand(num_tokens, -1).masked_fill(dense > logical[:, None], -1)
+        self._attend_rows(table, candidates, query, wv, out[:num_tokens], fused_gather=fused_gather)
 
     def _store_index_pool(self, table, positions, position_ndim, valid=None):
         ratio = self.indexer.ratio
@@ -540,7 +531,7 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
 
     def _read_pool(self, table, group_ends):
         rows = self._gather(table, group_ends)
-        return rows[:, self.kv_width : self.kv_width + INDEX_DIM].float()
+        return rows[..., self.kv_width : self.kv_width + INDEX_DIM].float()
 
     def _attend_rows(self, table, candidates, query, wv, out, *, fused_gather=False):
         if fused_gather:
@@ -548,11 +539,19 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
         else:
             kv = self._gather(table, candidates.clamp_min(0))[..., : self.kv_width]
             kv = kv.masked_fill(candidates[..., None] < 0, 0)
+        batch, kv_tokens = kv.shape[:2]
+        # shortcut: A3 FIA can miscompute larger batches with long KV, retest on a newer CANN.
         if (
             fused_gather
             and query.dtype == torch.bfloat16
             and (self.latent_dim, self.rope_dim) == (512, 64)
             and query.shape[1] in (4, 8)
+            and (
+                batch == 1
+                or kv_tokens <= FIA_BATCHED_KV_LIMIT
+                or batch <= FIA_LONG_KV_MAX_BATCH
+                and kv_tokens <= FIA_LONG_KV_LIMIT
+            )
         ):
             context = self._fused_decode_mla(query, kv, candidates)
         else:
@@ -591,9 +590,13 @@ class AscendHYV4FlashAttention(nn.Module, AttentionLayerBase):
 
     def _cache_slots(self, block_table, positions):
         block_size = self.kv_cache.shape[2]
-        pages = (positions // block_size).flatten()
-        blocks = block_table.index_select(0, pages).long()
-        return blocks * block_size + positions.flatten() % block_size
+        pages = positions // block_size
+        blocks = (
+            block_table.gather(1, pages.long())
+            if block_table.ndim == 2
+            else block_table.index_select(0, pages.flatten())
+        )
+        return blocks.flatten().long() * block_size + positions.flatten() % block_size
 
     def _gather(self, block_table, positions):
         cache = self.kv_cache

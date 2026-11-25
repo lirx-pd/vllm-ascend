@@ -145,11 +145,12 @@ def test_paged_prefill_and_decode_match_uninterrupted_attention(ratio, batched_p
 
     layer.kv_cache.zero_()
     run([0, 0], [5, 2])
+    pool_batches = []
     if ratio is not None:
         encode_keys = layer.indexer.encode_keys
 
         def encode_current_group(raw, positions):
-            assert raw.shape[0] == ratio
+            pool_batches.append(raw.shape[0])
             return encode_keys(raw, positions)
 
         monkeypatch.setattr(layer.indexer, "encode_keys", encode_current_group)
@@ -169,6 +170,8 @@ def test_paged_prefill_and_decode_match_uninterrupted_attention(ratio, batched_p
     torch.testing.assert_close(padded[0], full[0][4:5])
     torch.testing.assert_close(padded[1], torch.zeros_like(padded[1]))
     torch.testing.assert_close(layer.kv_cache, cache_before)
+    if ratio is not None:
+        assert pool_batches == [2 * ratio] * 3
 
     if ratio == 3:
         # Two requests share the first page and diverge before this group closes.
